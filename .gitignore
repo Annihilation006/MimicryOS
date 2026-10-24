@@ -1,0 +1,11 @@
+bootboot-master/
+legacy/
+iso_build/
+tools/
+.DS_Store
+Thumbs.db
+*.o
+*.elf
+*.img
+*.iso
+font.o
