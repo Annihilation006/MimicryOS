@@ -19,6 +19,8 @@ fn token_ep() -> u64 {
 }
 
 const SYS_IPC_SEND: u64 = 4;
+const SYS_OPEN: u64 = 6;
+const SYS_WRF: u64 = 7;
 
 // 往 IPC 通道丢一条消息
 fn ipc_send(data: &[u8]) -> i64 {
@@ -27,6 +29,34 @@ fn ipc_send(data: &[u8]) -> i64 {
         asm!(
             "int 0x80",
             in("rax") SYS_IPC_SEND, in("rdi") token_ep(),
+            in("rsi") data.as_ptr(), in("rdx") data.len(),
+            lateout("rax") ret,
+        );
+    }
+    ret
+}
+
+// 开文件 → 拿到绑着该文件的能力令牌
+fn sys_open(name: &[u8]) -> u64 {
+    let ret: u64;
+    unsafe {
+        asm!(
+            "int 0x80",
+            in("rax") SYS_OPEN, in("rdi") token(),
+            in("rsi") name.as_ptr(),
+            lateout("rax") ret,
+        );
+    }
+    ret
+}
+
+// 写文件
+fn wrf(ftok: u64, data: &[u8]) -> u64 {
+    let ret: u64;
+    unsafe {
+        asm!(
+            "int 0x80",
+            in("rax") SYS_WRF, in("rdi") ftok,
             in("rsi") data.as_ptr(), in("rdx") data.len(),
             lateout("rax") ret,
         );
@@ -67,8 +97,13 @@ const PALETTE: [u32; 4] = [0x00FFFF, 0xFF00FF, 0xFFFFFF, 0x00FF00];
 
 #[no_mangle]
 pub extern "C" fn user_payload_start() -> ! {
+    let ftok = sys_open(b"LOG"); // 文件能力令牌, 绑着 LOG
     let mut phase: usize = 0;
     loop {
+        // 把相位写进文件, 内核 fs 监视线程读出来上屏
+        let fill = (phase as u8) % 200 + 1;
+        let buf = [fill; 16];
+        let _ = wrf(ftok, &buf);
         // 擦旧下划线
         let mut x = 27i64;
         while x < 100 {

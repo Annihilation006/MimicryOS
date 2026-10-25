@@ -44,6 +44,8 @@ mod task;
 mod syscall;
 #[path = "userland.rs"]
 mod userland;
+#[path = "tmpfs.rs"]
+mod tmpfs;
 
 use core::panic::PanicInfo;
 
@@ -621,6 +623,9 @@ unsafe fn tlb_flush() {
     asm_write_cr3(c);
 }
 
+// tmpfs 实例: 载荷 open/write, 监视线程 read
+static mut FS: tmpfs::TmpFs = tmpfs::TmpFs::new();
+
 #[allow(dead_code)]
 // 调试探针: 打 cr3 + 四级表项 (排查完就删)
 unsafe fn pte_dump(va: u64, tag: &[u8]) {
@@ -695,6 +700,65 @@ pub extern "C" fn rust_syscall_entry(frame: *mut syscall::SyscallFrame) {
             };
             return;
         }
+        // 6/7/8 = 文件打开/写/读: 文件令牌 = grant(CAP_VMO, 文件号)
+        if f.rax == 6 {
+            // OPEN: rdi=调用方任一有效令牌, rsi=名字指针 → rax=新文件令牌
+            f.rax = if fb_cap_check(f.rdi as u32) {
+                let mut name = [0u8; tmpfs::NAME_LEN];
+                let src = f.rsi as *const u8;
+                let mut k = 0usize;
+                while k < tmpfs::NAME_LEN {
+                    *(name.as_mut_ptr().add(k)) = *src.add(k);
+                    k += 1;
+                }
+                match FS.open(&name) {
+                    Some(h) => rust_cap_grant(syscall::CAP_FRAMEBUF, h as u32) as u64,
+                    None => u64::MAX,
+                }
+            } else {
+                u64::MAX
+            };
+            return;
+        }
+        if f.rax == 7 || f.rax == 8 {
+            // WRF/RDF: rdi=文件令牌 rsi=用户缓冲 rdx=长度
+            let fid = match (unsafe {
+                let c: *mut Option<capability::CSpace> = core::ptr::addr_of_mut!(CAPS);
+                match (*c).as_mut() {
+                    Some(cs) => cs.lookup(f.rdi as u32),
+                    None => None,
+                }
+            }) {
+                Some((t, fid)) if t == syscall::CAP_FRAMEBUF => fid as usize,
+                _ => {
+                    f.rax = u64::MAX;
+                    return;
+                }
+            };
+            let len = if f.rdx > 64 { 64 } else { f.rdx } as usize;
+            if f.rax == 7 {
+                let mut tmp = [0u8; 64];
+                let src = f.rsi as *const u8;
+                let mut k = 0usize;
+                while k < len {
+                    *(tmp.as_mut_ptr().add(k)) = *src.add(k);
+                    k += 1;
+                }
+                let sl = core::slice::from_raw_parts(tmp.as_ptr(), len);
+                f.rax = FS.write(fid, 0, sl) as u64;
+            } else {
+                let mut tmp = [0u8; 64];
+                let n = FS.read(fid, 0, &mut tmp);
+                let dst = f.rsi as *mut u8;
+                let mut k = 0usize;
+                while k < n {
+                    *dst.add(k) = *(tmp.as_ptr().add(k));
+                    k += 1;
+                }
+                f.rax = n as u64;
+            }
+            return;
+        }
         let mut fb = syscall::Framebuffer {
             base: FB_BASE,
             scan: FB_SCAN,
@@ -743,6 +807,24 @@ extern "C" fn thread_beta() -> ! {
 static mut STACK_C: [u8; 16384] = [0; 16384];
 static mut IPC_COUNT: u32 = 0;
 static mut IPC_SCRATCH: [u8; 64] = [0; 64];
+
+// fs 监视线程: 读 LOG 文件首字节上屏第 9 行, 爬升 = 用户写→内核存→内核读 全通
+static mut STACK_D: [u8; 16384] = [0; 16384];
+
+extern "C" fn thread_fswatch() -> ! {
+    loop {
+        unsafe {
+            let mut b = [0u8; 1];
+            let n = FS.read(0, 0, &mut b);
+            if n == 1 {
+                draw_count(7, 9, b[0] as u32, 0xFFFFFF);
+            }
+        }
+        for _ in 0..300000 {
+            core::hint::spin_loop();
+        }
+    }
+}
 
 extern "C" fn thread_ipc() -> ! {
     loop {
@@ -794,10 +876,12 @@ pub extern "C" fn rust_tasks_init() -> i32 {
         let b = (*s).spawn(thread_beta as u64, sb);
         let sc = core::ptr::addr_of_mut!(STACK_C) as u64 + 16384;
         let d = (*s).spawn(thread_ipc as u64, sc);
+        let sd = core::ptr::addr_of_mut!(STACK_D) as u64 + 16384;
+        let e5 = (*s).spawn(thread_fswatch as u64, sd);
         let ue = userland::user_payload_start as u64;
         let us = core::ptr::addr_of!(user_stack_top) as u64;
         let c = (*s).spawn_user(ue, us);
-        if a.is_none() || b.is_none() || c.is_none() || d.is_none() {
+        if a.is_none() || b.is_none() || c.is_none() || d.is_none() || e5.is_none() {
             return -1;
         }
         // 直映射已上线, 页表修补在 Rust 里做
