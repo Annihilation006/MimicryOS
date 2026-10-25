@@ -29,7 +29,8 @@ typedef struct {
     unsigned long long rip, cs, rflags, rsp, ss;
 } __attribute__((packed)) interrupt_frame_t;
 
-typedef void (*interrupt_handler_t)(interrupt_frame_t*);
+/* 处理器返回新 rsp (0=不切换), 中断桩据此换栈 — 抢占式调度的机关 */
+typedef unsigned long long (*interrupt_handler_t)(interrupt_frame_t*);
 
 void idt_init(void);
 void idt_set_gate(int num, unsigned long long base, unsigned short selector, unsigned char flags);

@@ -38,6 +38,8 @@ mod aspace;
 mod capability;
 #[path = "ipc.rs"]
 mod ipc;
+#[path = "task.rs"]
+mod task;
 
 use core::panic::PanicInfo;
 
@@ -521,6 +523,93 @@ pub extern "C" fn rust_vmo_unref(handle: i32) -> i32 {
         }
         let _ = slot.unpin(fa);
         0
+    }
+}
+
+// ============================================================
+// 抢占式调度（03-process 第一步）+ 两个 Rust 内核线程
+// ============================================================
+
+static mut SCHED: task::Scheduler = task::Scheduler::new();
+static mut STACK_A: [u8; 16384] = [0; 16384];
+static mut STACK_B: [u8; 16384] = [0; 16384];
+static mut CNT_A: u32 = 0;
+static mut CNT_B: u32 = 0;
+
+extern "C" {
+    fn fb_putchar(cx: i32, cy: i32, c: u8, color: u32);
+    fn fb_putpixel(x: i32, y: i32, color: u32);
+}
+
+unsafe fn draw_count(col: i32, row: i32, v: u32, color: u32) {
+    for x in 0..27i32 {
+        for y in 0..16i32 {
+            fb_putpixel(col * 9 + x, row * 17 + y, 0x000000);
+        }
+    }
+    fb_putchar(col, row, b'0' + ((v / 100) % 10) as u8, color);
+    fb_putchar(col + 1, row, b'0' + ((v / 10) % 10) as u8, color);
+    fb_putchar(col + 2, row, b'0' + (v % 10) as u8, color);
+}
+
+// 线程体只做计数+自旋, 所有渲染收归 pit_tick 上下文, 避免多点位画屏打架
+extern "C" fn thread_alpha() -> ! {
+    loop {
+        unsafe {
+            CNT_A = CNT_A.wrapping_add(1);
+        }
+        for _ in 0..500000 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+extern "C" fn thread_beta() -> ! {
+    loop {
+        unsafe {
+            CNT_B = CNT_B.wrapping_add(1);
+        }
+        for _ in 0..500000 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+// kernel_main 里 enable_interrupts 之前调一次
+#[no_mangle]
+pub extern "C" fn rust_tasks_init() -> i32 {
+    unsafe {
+        let s: *mut task::Scheduler = core::ptr::addr_of_mut!(SCHED);
+        (*s).adopt_current(); // 现在跑着的 kernel_main/shell 是任务 0
+        let sa = core::ptr::addr_of_mut!(STACK_A) as u64 + 16384;
+        let sb = core::ptr::addr_of_mut!(STACK_B) as u64 + 16384;
+        let a = (*s).spawn(thread_alpha as u64, sa);
+        let b = (*s).spawn(thread_beta as u64, sb);
+        if a.is_none() || b.is_none() {
+            return -1;
+        }
+        0
+    }
+}
+
+// pit_tick 取线程计数做单点渲染
+#[no_mangle]
+pub extern "C" fn rust_thread_counts(which: u32) -> u32 {
+    unsafe {
+        if which == 0 {
+            CNT_A
+        } else {
+            CNT_B
+        }
+    }
+}
+
+// pit_tick 每 tick 调, 传当前现场位置, 返回下一个该跑的 rsp (0=不动)
+#[no_mangle]
+pub extern "C" fn rust_schedule(frame: u64) -> u64 {
+    unsafe {
+        let s: *mut task::Scheduler = core::ptr::addr_of_mut!(SCHED);
+        (*s).schedule(frame)
     }
 }
 

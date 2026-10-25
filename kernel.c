@@ -847,19 +847,33 @@ void boot_animation(void) {
 /* [test] PIT 100Hz 的 tick 计数, 中断上线的活体证据:
  * 右上角三位数计数器每 32 tick 刷一次, 跳动 = IRQ0 活着 */
 static volatile unsigned int pit_ticks = 0;
-static void pit_tick(interrupt_frame_t* f) {
-    (void)f;
+extern unsigned long long rust_schedule(unsigned long long frame);
+extern unsigned int rust_thread_counts(unsigned int which);
+extern void rust_tasks_init(void);
+static unsigned long long pit_tick(interrupt_frame_t* f) {
     pit_ticks++;
-    if ((pit_ticks & 31) == 0) {
-        unsigned int t = pit_ticks;
-        int cols = (int)(bootboot.fb_width / 9);
+    unsigned int t = pit_ticks;
+    int cols = (int)(bootboot.fb_width / 9);
+    if ((t & 31) == 0) {
         for (int x = 0; x < 27; x++)
             for (int y = 0; y < 16; y++)
                 fb_putpixel((cols - 3) * 9 + x, y, 0x000000);
         fb_putchar(cols - 3, 0, '0' + (t / 100) % 10, 0x00FF00);
         fb_putchar(cols - 2, 0, '0' + (t / 10) % 10, 0x00FF00);
         fb_putchar(cols - 1, 0, '0' + t % 10, 0x00FF00);
+        /* [test] 两个 Rust 线程的计数, 由 tick 上下文单点渲染 */
+        for (int r = 0; r < 2; r++) {
+            unsigned int v = rust_thread_counts(r);
+            unsigned int color = (r == 0) ? 0x00FF00 : 0x00FFFF;
+            for (int x = 0; x < 27; x++)
+                for (int y = 0; y < 16; y++)
+                    fb_putpixel(3 * 9 + x, (6 + r) * 17 + y, 0x000000);
+            fb_putchar(3, 6 + r, '0' + v / 100 % 10, color);
+            fb_putchar(4, 6 + r, '0' + v / 10 % 10, color);
+            fb_putchar(5, 6 + r, '0' + v % 10, color);
+        }
     }
+    return rust_schedule((unsigned long long)f);
 }
 
 void kernel_main(void) {
@@ -884,6 +898,7 @@ void kernel_main(void) {
     outb(0x43, 0x36);           /* 通道0 方波 */
     outb(0x40, 11932 & 0xFF);   /* 1193182Hz / 100Hz */
     outb(0x40, 11932 >> 8);
+    rust_tasks_init();          /* [test] 两个 Rust 内核线程进就绪队列 */
     enable_interrupts();
     for (volatile long w = 0; w < 50000000; w++);
     fb_print("[test] interrupts ");

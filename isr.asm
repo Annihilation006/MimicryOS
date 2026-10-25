@@ -80,6 +80,11 @@ common_irq:
     mov rdi, rsp
     cld
     call irq_dispatcher
+    ; handler 返回新 rsp 就换栈 — 抢占式调度机关
+    test rax, rax
+    jz .keep
+    mov rsp, rax
+.keep:
     POPA64
     add rsp, 16
     iretq

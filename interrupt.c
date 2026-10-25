@@ -27,10 +27,11 @@ void interrupt_dispatcher(interrupt_frame_t* frame) {
     }
 }
 
-void irq_dispatcher(interrupt_frame_t* frame) {
+unsigned long long irq_dispatcher(interrupt_frame_t* frame) {
     int irq = (int)frame->int_no - IRQ_BASE;
     pic_send_eoi((unsigned char)irq);
     if (interrupt_handlers[frame->int_no]) {
-        interrupt_handlers[frame->int_no](frame);
+        return interrupt_handlers[frame->int_no](frame);
     }
+    return 0;
 }
