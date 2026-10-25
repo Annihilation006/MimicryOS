@@ -79,6 +79,29 @@ impl FrameAllocator {
         None
     }
 
+    /// 从高端分配：怕踩内核镜像的常驻结构（页表等）走这条
+    pub unsafe fn alloc_top(&mut self) -> Option<usize> {
+        if self.free_cnt == 0 || self.nwords == 0 {
+            return None;
+        }
+        let mut w = self.nwords;
+        while w > 0 {
+            w -= 1;
+            let word = *self.bitmap.add(w);
+            if word != !0u64 {
+                let lz = word.leading_zeros() as usize;
+                let b = 63 - lz; // 最高位的 0
+                let idx = w * WORD_BITS + b;
+                if idx < self.total {
+                    *self.bitmap.add(w) = word | (1u64 << b);
+                    self.free_cnt -= 1;
+                    return Some(idx);
+                }
+            }
+        }
+        None
+    }
+
     /// 释放一个帧。越界或重复释放返回 false。
     pub unsafe fn free(&mut self, idx: usize) -> bool {
         if idx >= self.total {
@@ -103,6 +126,10 @@ impl FrameAllocator {
 pub trait FrameSource {
     /// 返回物理地址（帧号 × 4096），无空闲返回 None。
     fn alloc_frame(&mut self) -> Option<u64>;
+    /// 从高端拿帧（页表等怕被踩的常驻结构用），默认退化成普通分配
+    fn alloc_frame_top(&mut self) -> Option<u64> {
+        self.alloc_frame()
+    }
     fn free_frame(&mut self, phys: u64);
     /// 取得该物理帧当前可写的虚拟地址。
     /// 前提（内核侧）：BOOTBOOT 建立的低地址身份映射仍然有效，
@@ -116,6 +143,10 @@ pub static mut DIRECT: bool = false;
 impl FrameSource for FrameAllocator {
     fn alloc_frame(&mut self) -> Option<u64> {
         unsafe { self.alloc().map(|f| f as u64 * FRAME_SIZE) }
+    }
+    // 从高位往下扫, 内核镜像附近的低位帧动不得
+    fn alloc_frame_top(&mut self) -> Option<u64> {
+        unsafe { self.alloc_top().map(|f| f as u64 * FRAME_SIZE) }
     }
     fn free_frame(&mut self, phys: u64) {
         let _ = unsafe { self.free((phys / FRAME_SIZE) as usize) };

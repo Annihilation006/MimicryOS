@@ -40,6 +40,10 @@ mod capability;
 mod ipc;
 #[path = "task.rs"]
 mod task;
+#[path = "syscall.rs"]
+mod syscall;
+#[path = "userland.rs"]
+mod userland;
 
 use core::panic::PanicInfo;
 
@@ -196,7 +200,8 @@ pub extern "C" fn rust_mem_init() -> usize {
             let end = e.ptr.saturating_add(bytes);
             let f0 = ((start + frame::FRAME_SIZE - 1) / frame::FRAME_SIZE) as usize;
             let f1 = ((end + frame::FRAME_SIZE - 1) / frame::FRAME_SIZE) as usize;
-            let f0 = f0.max(1); // 跳过第 0 帧（IVT/BIOS 数据区）
+            // 1MB 以下没有恒等映射（页表/堆都在这），跳过 0..256 帧
+            let f0 = f0.max(1536);
             if f1 > f0 {
                 fa.mark_free_range(f0, f1 - f0);
             }
@@ -535,12 +540,146 @@ static mut STACK_A: [u8; 16384] = [0; 16384];
 static mut STACK_B: [u8; 16384] = [0; 16384];
 static mut CNT_A: u32 = 0;
 static mut CNT_B: u32 = 0;
+pub static mut PAYLOAD_TOKEN: u32 = 1; // rust_tasks_init 里发真值
 
 extern "C" {
     fn fb_putchar(cx: i32, cy: i32, c: u8, color: u32);
     fn fb_putpixel(x: i32, y: i32, color: u32);
-    static user_payload_start: u8; // usermode.asm 的符号, 地址即入口
-    static user_stack_top: u8;
+    static user_stack_top: u8; // usermode.asm 的符号
+}
+
+// ---- 帧缓冲参数 (rust_tasks_init 从 bootboot 抄) ----
+static mut FB_BASE: u64 = 0;
+static mut FB_SCAN: u64 = 4096;
+static mut FB_W: i64 = 1024;
+static mut FB_H: i64 = 768;
+
+// Ring3 放行: 走直映射改页表 (1MB 以下没恒等映射, 老 asm 版一直在对空气写)
+// 沿 PML4→PDPT→PD 全路 U/S+清NX, 末级 4K 时 512 个 PTE 全放行
+unsafe fn patch_user_region(va: u64) {
+    let mask = 0x000F_FFFF_FFFF_F000;
+    let mut table = asm_read_cr3() & mask;
+
+    let i4 = ((va >> 39) & 511) as usize;
+    let sl = (table + (i4 as u64) * 8) as *mut u64;
+    let mut e = *sl;
+    e |= 6;
+    e &= !0x8000_0000_0000_0000;
+    *sl = e;
+    table = e & mask;
+
+    let i3 = ((va >> 30) & 511) as usize;
+    let sl = (table + (i3 as u64) * 8) as *mut u64;
+    e = *sl;
+    let big1 = e & 0x80 != 0;
+    e |= 6;
+    e &= !0x8000_0000_0000_0000;
+    *sl = e;
+    if big1 {
+        tlb_flush();
+        return;
+    }
+    table = e & mask;
+
+    let i2 = ((va >> 21) & 511) as usize;
+    let sl = (table + (i2 as u64) * 8) as *mut u64;
+    e = *sl;
+    let big2 = e & 0x80 != 0;
+    e |= 6;
+    e &= !0x8000_0000_0000_0000;
+    *sl = e;
+    if big2 {
+        tlb_flush();
+        return;
+    }
+    table = e & mask;
+
+    for i in 0..512u64 {
+        let sl = (table + i * 8) as *mut u64;
+        let pte = *sl;
+        if pte & 1 != 0 {
+            *sl = (pte | 6) & !0x8000_0000_0000_0000;
+        }
+    }
+    tlb_flush();
+}
+
+unsafe fn tlb_flush() {
+    let c = asm_read_cr3();
+    asm_write_cr3(c);
+}
+
+// 调试探针: 打 cr3 + 四级表项 (排查完就删)
+unsafe fn pte_dump(va: u64, tag: &[u8]) {
+    let cr3 = asm_read_cr3() & 0x000F_FFFF_FFFF_F000;
+    let mut line = [0u8; 240];
+    let mut pos = 0usize;
+    let mut put = |b: u8, pos: &mut usize| {
+        *(line.as_mut_ptr().add(*pos)) = b;
+        *pos += 1;
+    };
+    for &b in tag {
+        put(b, &mut pos);
+    }
+    put(b' ', &mut pos);
+    let mut hx = [0u8; 16];
+    fmt_hex64(cr3, &mut hx);
+    for &h in &hx {
+        put(h, &mut pos);
+    }
+    put(b' ', &mut pos);
+    let mut t = cr3;
+    for lvl in 0..4usize {
+        let e = *((t + (((va >> (39 - lvl * 9)) & 511) as u64) * 8) as *const u64);
+        fmt_hex64(e, &mut hx);
+        for &h in &hx {
+            put(h, &mut pos);
+        }
+        put(b' ', &mut pos);
+        t = e & 0x000F_FFFF_FFFF_F000;
+        if e & 0x80 != 0 && lvl < 3 {
+            put(b'L', &mut pos);
+            put(b'P', &mut pos);
+            break;
+        }
+    }
+    put(b'\n', &mut pos);
+    put(0, &mut pos);
+    fb_print(line.as_ptr());
+}
+
+fn fmt_hex64(v: u64, out: &mut [u8; 16]) -> usize {
+    let hex = b"0123456789ABCDEF";
+    for i in 0..16 {
+        out[i] = hex[((v >> (60 - i * 4)) & 0xF) as usize];
+    }
+    16
+}
+
+// 能力检查: 令牌得是 CAP_VMO 槽位才算帧缓冲的钥匙
+fn fb_cap_check(token: u32) -> bool {
+    unsafe {
+        let c: *mut Option<capability::CSpace> = core::ptr::addr_of_mut!(CAPS);
+        match (*c).as_mut() {
+            Some(cs) => matches!(cs.lookup(token), Some((t, _)) if t == capability::CAP_VMO),
+            None => false,
+        }
+    }
+}
+
+// int0x80 跳板落点: 全部逻辑在 syscall.rs
+#[no_mangle]
+pub extern "C" fn rust_syscall_entry(frame: *mut syscall::SyscallFrame) {
+    unsafe {
+        let f = &mut *frame;
+        let mut fb = syscall::Framebuffer {
+            base: FB_BASE,
+            scan: FB_SCAN,
+            w: FB_W,
+            h: FB_H,
+        };
+        syscall::dispatch(f, fb_cap_check, &mut fb);
+    }
 }
 
 unsafe fn draw_count(col: i32, row: i32, v: u32, color: u32) {
@@ -581,18 +720,36 @@ extern "C" fn thread_beta() -> ! {
 #[no_mangle]
 pub extern "C" fn rust_tasks_init() -> i32 {
     unsafe {
+        // 能力系统上线, 发一把帧缓冲钥匙 (slot 0 空, 分配从栈顶走, 真槽位传载荷)
+        rust_cap_init();
+        let tok = rust_cap_grant(syscall::CAP_FRAMEBUF, 0);
+        let tp: *mut u32 = core::ptr::addr_of_mut!(PAYLOAD_TOKEN);
+        *tp = tok;
+        // 帧缓冲参数从 bootboot 抄 (fb_ptr@0x28, scanline/width/height)
+        let bb = &*(0xffff_ffff_ffe0_0000usize as *const u8);
+        let p = bb as *const u8;
+        FB_BASE = core::ptr::read_unaligned(p.add(0x28) as *const u64);
+        FB_SCAN = core::ptr::read_unaligned(p.add(0x3C) as *const u32) as u64;
+        FB_W = core::ptr::read_unaligned(p.add(0x34) as *const u32) as i64;
+        FB_H = core::ptr::read_unaligned(p.add(0x38) as *const u32) as i64;
+
         let s: *mut task::Scheduler = core::ptr::addr_of_mut!(SCHED);
         (*s).adopt_current(); // 现在跑着的 kernel_main/shell 是任务 0
         let sa = core::ptr::addr_of_mut!(STACK_A) as u64 + 16384;
         let sb = core::ptr::addr_of_mut!(STACK_B) as u64 + 16384;
         let a = (*s).spawn(thread_alpha as u64, sa);
         let b = (*s).spawn(thread_beta as u64, sb);
-        let ue = core::ptr::addr_of!(user_payload_start) as u64;
+        let ue = userland::user_payload_start as u64;
         let us = core::ptr::addr_of!(user_stack_top) as u64;
         let c = (*s).spawn_user(ue, us);
         if a.is_none() || b.is_none() || c.is_none() {
             return -1;
         }
+        // 直映射已上线, 页表修补在 Rust 里做
+        patch_user_region(ue);
+        patch_user_region(us);
+        pte_dump(us, b"STACK");
+        pte_dump(ue, b"CODE");
         0
     }
 }
@@ -630,10 +787,36 @@ pub extern "C" fn rust_vm_bootstrap(max_phys: u64) -> i32 {
             Some(f) => f,
             None => return -1,
         };
-        match vmboot::build(fa, asm_read_cr3(), max_phys) {
+        let old = asm_read_cr3();
+        match vmboot::build(fa, old, max_phys) {
             Some(np) => {
                 asm_write_cr3(np);
                 frame::DIRECT = true;
+                let mut hx = [0u8; 16];
+                let mut ln = [0u8; 64];
+                let mut p = 0;
+                for &b in b"[vm] old=" {
+                    ln[p] = b;
+                    p += 1;
+                }
+                fmt_hex64(old, &mut hx);
+                for &h in &hx {
+                    ln[p] = h;
+                    p += 1;
+                }
+                for &b in b" new=" {
+                    ln[p] = b;
+                    p += 1;
+                }
+                fmt_hex64(np, &mut hx);
+                for &h in &hx {
+                    ln[p] = h;
+                    p += 1;
+                }
+                ln[p] = b'\n';
+                p += 1;
+                ln[p] = 0;
+                fb_print(ln.as_ptr());
                 0
             }
             None => -1,

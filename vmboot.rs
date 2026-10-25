@@ -8,21 +8,21 @@ unsafe fn zp(fs: &mut dyn FrameSource, p: u64) {
 
 // 返回新 pml4 物理址，不动 CR3（踢的动作归调用方）
 pub unsafe fn build(fs: &mut dyn FrameSource, old_cr3: u64, max_phys: u64) -> Option<u64> {
-    let np = fs.alloc_frame()?;
+    let np = fs.alloc_frame_top()?;
     zp(fs, np);
     let old = fs.frame_to_virt(old_cr3 & PHYS_MASK) as *const u64;
     let nu = fs.frame_to_virt(np) as *mut u64;
-    for i in 256..512 {
-        *nu.add(i) = *old.add(i); // 高半区原样搬，内核/fb/bootboot 都在里面
+    for i in 0..512 {
+        *nu.add(i) = *old.add(i); // 全量搬: 恒等映射在低半区槽位, 少了它 C 写 fb 就死
     }
 
     // 直映射 2M 大页，slot 自己算别抄魔数
     let slot = (DIRECT_BASE >> 39) as usize & 511;
-    let pdpt = fs.alloc_frame()?;
+    let pdpt = fs.alloc_frame_top()?;
     zp(fs, pdpt);
     let gigs = ((max_phys + 0x3FFF_FFFF) / 0x4000_0000).max(1);
     for g in 0..gigs {
-        let pd = fs.alloc_frame()?;
+        let pd = fs.alloc_frame_top()?;
         zp(fs, pd);
         let pdv = fs.frame_to_virt(pd) as *mut u64;
         for j in 0..512u64 {
