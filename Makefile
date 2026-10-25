@@ -32,7 +32,7 @@ ASM = nasm
 ASMFLAGS = -f elf64
 OBJCOPY = objcopy
 
-OBJS = kernel.o filesystem.mod.o mouse.mod.o desktop.mod.o png.mod.o font.o cpu.o idt.o interrupt.o pic.o console.o isr.o
+OBJS = kernel.o filesystem.mod.o mouse.mod.o desktop.mod.o png.mod.o font.o cpu.o idt.o interrupt.o pic.o console.o isr.o usermode.o
 
 all: kernel.elf
 
@@ -71,6 +71,10 @@ cpu.o: cpu.asm
 # test 分支新增：中断桩（48 个 isr/irq + idt_load）
 isr.o: isr.asm
 	$(ASM) $(ASMFLAGS) isr.asm -o isr.o
+
+# test 分支新增：Ring3 用户态全家桶（纯汇编）
+usermode.o: usermode.asm
+	$(ASM) $(ASMFLAGS) usermode.asm -o usermode.o
 
 kernel.elf: $(OBJS) linker.ld
 	$(LD) -m elf_x86_64 -T linker.ld --no-pie -o kernel.elf $(OBJS)

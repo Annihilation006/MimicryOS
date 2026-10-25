@@ -5,6 +5,8 @@
 pub const FRAME_SLOTS: usize = 22; // 15 gpr + int_no + err + rip/cs/rflags/rsp/ss
 pub const KCODE: u64 = 0x08;
 pub const KDATA: u64 = 0x10;
+pub const UCODE: u64 = 0x1B; // 0x18|3 — iretq 进 ring3 必须 RPL=3
+pub const UDATA: u64 = 0x23; // 0x20|3
 
 #[derive(Clone, Copy)]
 pub struct Task {
@@ -37,25 +39,8 @@ impl Scheduler {
     }
 
     // stack_top 必须页对齐; 入口永远不返回
-    // 下标全走裸指针: 固定数组运行时索引会生成 bounds-check panic 桩, 裸机链不上
     pub unsafe fn spawn(&mut self, entry: u64, stack_top: u64) -> Option<usize> {
-        if self.n >= 8 {
-            return None;
-        }
-        let frame = stack_top - (FRAME_SLOTS * 8) as u64;
-        let p = frame as *mut u64;
-        for i in 0..17 {
-            *p.add(i) = 0;
-        }
-        *p.add(17) = entry;          // rip
-        *p.add(18) = KCODE;          // cs
-        *p.add(19) = 0x202;          // rflags, IF=1
-        *p.add(20) = stack_top - 8;  // rsp, 摆成被 call 过的样子
-        *p.add(21) = KDATA;          // ss
-        let t = core::ptr::addr_of_mut!(self.t) as *mut Task;
-        *t.add(self.n) = Task { rsp: frame, live: true };
-        self.n += 1;
-        Some(self.n - 1)
+        self.spawn_with(entry, stack_top, KCODE, KDATA)
     }
 
     // 每 tick 被调: frame=当前现场位置。返回下一个该跑的 rsp, 单任务原样返回
@@ -78,6 +63,37 @@ impl Scheduler {
         }
         self.cur = i;
         (*t.add(i)).rsp
+    }
+
+    // ring3 任务: 帧带用户段选择子, iretq 直接落用户态
+    pub unsafe fn spawn_user(&mut self, entry: u64, stack_top: u64) -> Option<usize> {
+        self.spawn_with(entry, stack_top, UCODE, UDATA)
+    }
+
+    unsafe fn spawn_with(
+        &mut self,
+        entry: u64,
+        stack_top: u64,
+        cs: u64,
+        ss: u64,
+    ) -> Option<usize> {
+        if self.n >= 8 {
+            return None;
+        }
+        let frame = stack_top - (FRAME_SLOTS * 8) as u64;
+        let p = frame as *mut u64;
+        for i in 0..17 {
+            *p.add(i) = 0;
+        }
+        *p.add(17) = entry;
+        *p.add(18) = cs;
+        *p.add(19) = 0x202;
+        *p.add(20) = stack_top - 8;
+        *p.add(21) = ss;
+        let t = core::ptr::addr_of_mut!(self.t) as *mut Task;
+        *t.add(self.n) = Task { rsp: frame, live: true };
+        self.n += 1;
+        Some(self.n - 1)
     }
 }
 
@@ -146,5 +162,18 @@ mod tests {
             assert!(unsafe { s.spawn(0x1000, top) }.is_some());
         }
         unsafe { assert_eq!(s.spawn(0x1000, 4096), None); }
+    }
+
+    #[test]
+    fn t5_user_frame_selectors() {
+        let (_s0, top) = mkstack();
+        let mut s = Scheduler::new();
+        unsafe { s.spawn_user(0xBEEF, top) }.unwrap();
+        let p = (top - 176) as *const u64;
+        unsafe {
+            assert_eq!(*p.add(17), 0xBEEF);
+            assert_eq!(*p.add(18), UCODE);
+            assert_eq!(*p.add(21), UDATA);
+        }
     }
 }

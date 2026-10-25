@@ -893,6 +893,8 @@ void kernel_main(void) {
      * 开机动画期间 cli 着, 这里装好再 sti */
     idt_init();
     pic_remap();
+    extern void usermode_init(void);
+    usermode_init();            /* [test] GDT/TSS/int0x80 全 asm */
     register_interrupt_handler(32, pit_tick);
     pic_clear_mask(0);          /* IRQ0 计时器 */
     outb(0x43, 0x36);           /* 通道0 方波 */

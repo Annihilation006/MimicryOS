@@ -539,6 +539,8 @@ static mut CNT_B: u32 = 0;
 extern "C" {
     fn fb_putchar(cx: i32, cy: i32, c: u8, color: u32);
     fn fb_putpixel(x: i32, y: i32, color: u32);
+    static user_payload_start: u8; // usermode.asm 的符号, 地址即入口
+    static user_stack_top: u8;
 }
 
 unsafe fn draw_count(col: i32, row: i32, v: u32, color: u32) {
@@ -585,7 +587,10 @@ pub extern "C" fn rust_tasks_init() -> i32 {
         let sb = core::ptr::addr_of_mut!(STACK_B) as u64 + 16384;
         let a = (*s).spawn(thread_alpha as u64, sa);
         let b = (*s).spawn(thread_beta as u64, sb);
-        if a.is_none() || b.is_none() {
+        let ue = core::ptr::addr_of!(user_payload_start) as u64;
+        let us = core::ptr::addr_of!(user_stack_top) as u64;
+        let c = (*s).spawn_user(ue, us);
+        if a.is_none() || b.is_none() || c.is_none() {
             return -1;
         }
         0
