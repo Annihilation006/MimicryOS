@@ -32,7 +32,7 @@ ASM = nasm
 ASMFLAGS = -f elf64
 OBJCOPY = objcopy
 
-OBJS = kernel.o filesystem.mod.o mouse.mod.o desktop.mod.o png.mod.o font.o
+OBJS = kernel.o filesystem.mod.o mouse.mod.o desktop.mod.o png.mod.o font.o cpu.o
 
 all: kernel.elf
 
@@ -48,6 +48,10 @@ png.mod.o: png.mod.c stb_image.h
 # objcopy 把二进制字体包成 ELF 目标文件，导出 _binary_font_psf_start 等符号。
 font.o: font.psf
 	$(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 font.psf font.o
+
+# test 分支新增：x86_64 汇编 CPU 原语（端口IO/控制寄存器/CPUID/RDTSC/MSR）
+cpu.o: cpu.asm
+	$(ASM) $(ASMFLAGS) cpu.asm -o cpu.o
 
 kernel.elf: $(OBJS) linker.ld
 	$(LD) -m elf_x86_64 -T linker.ld --no-pie -o kernel.elf $(OBJS)
