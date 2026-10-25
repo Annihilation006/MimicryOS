@@ -30,12 +30,45 @@ mod kmem;
 mod pagetable;
 #[path = "vma.rs"]
 mod vma;
+#[path = "vmboot.rs"]
+mod vmboot;
+#[path = "aspace.rs"]
+mod aspace;
+#[path = "capability.rs"]
+mod capability;
+#[path = "ipc.rs"]
+mod ipc;
 
 use core::panic::PanicInfo;
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     loop {}
+}
+
+// 裸机直链没人给 memmove（他的 C 侧只有 memset/memcpy），自己补
+#[no_mangle]
+pub unsafe extern "C" fn memmove(
+    dst: *mut core::ffi::c_void,
+    src: *const core::ffi::c_void,
+    n: usize,
+) -> *mut core::ffi::c_void {
+    let d = dst as *mut u8;
+    let s = src as *const u8;
+    if (d as usize) < (s as usize) {
+        let mut i = 0;
+        while i < n {
+            *d.add(i) = *s.add(i);
+            i += 1;
+        }
+    } else {
+        let mut i = n;
+        while i > 0 {
+            i -= 1;
+            *d.add(i) = *s.add(i);
+        }
+    }
+    dst
 }
 
 /* ---- main 分支既有 C 接口（kernel.c）---- */
@@ -47,6 +80,7 @@ extern "C" {
 extern "C" {
     fn asm_read_cr0() -> u64;
     fn asm_read_cr3() -> u64;
+    fn asm_write_cr3(val: u64);
     fn asm_cpuid(leaf: u32, subleaf: u32, out: *mut u32);
     fn asm_invlpg(addr: u64);
 }
@@ -303,6 +337,244 @@ pub extern "C" fn rust_unmap_page(vaddr: u64) -> i32 {
             }
             Err(_) => -1,
         }
+    }
+}
+
+// ============================================================
+// 能力 + IPC
+// ============================================================
+
+const NCAPS: usize = 256;
+const NCHMSG: usize = 32;
+const NVMO: usize = 8;
+
+static mut CAP_NODES: [capability::CapNode; NCAPS] =
+    [capability::CapNode { obj_type: 0, obj_id: 0, parent: 0, first_child: capability::NO_SLOT, next_sibling: capability::NO_SLOT }; NCAPS];
+static mut CAP_USED: [bool; NCAPS] = [false; NCAPS];
+static mut CAP_FREE: [u32; NCAPS] = [0; NCAPS];
+static mut CAPS: Option<capability::CSpace> = None;
+
+static mut CH_STORAGE: [ipc::Message; NCHMSG] =
+    [ipc::Message { cap: 0, len: 0, data: [0; ipc::MSG_PAYLOAD] }; NCHMSG];
+static mut CHAN: Option<ipc::Channel> = None;
+
+static mut VMO_TABLE: [ipc::Vmo; NVMO] =
+    [ipc::Vmo { frames: [0; ipc::VMO_MAX_PAGES], npages: 0, refs: 0 }; NVMO];
+
+unsafe fn caps_opt() -> Option<&'static mut capability::CSpace> {
+    let p: *mut Option<capability::CSpace> = core::ptr::addr_of_mut!(CAPS);
+    (*p).as_mut()
+}
+
+#[no_mangle]
+pub extern "C" fn rust_cap_init() -> i32 {
+    unsafe {
+        let p: *mut Option<capability::CSpace> = core::ptr::addr_of_mut!(CAPS);
+        *p = Some(capability::CSpace::new(
+            core::ptr::addr_of_mut!(CAP_NODES) as *mut capability::CapNode,
+            core::ptr::addr_of_mut!(CAP_USED) as *mut bool,
+            core::ptr::addr_of_mut!(CAP_FREE) as *mut u32,
+            NCAPS,
+        ));
+    }
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn rust_cap_grant(obj_type: u32, obj_id: u32) -> u32 {
+    match unsafe { caps_opt() } {
+        Some(c) => c.grant(obj_type, obj_id, capability::NO_SLOT),
+        None => capability::NO_SLOT,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rust_cap_derive(parent: u32) -> u32 {
+    match unsafe { caps_opt() } {
+        Some(c) => c.derive(parent),
+        None => capability::NO_SLOT,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rust_cap_revoke(slot: u32) -> usize {
+    match unsafe { caps_opt() } {
+        Some(c) => c.revoke(slot),
+        None => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rust_cap_lookup(slot: u32, out_type: *mut u32, out_id: *mut u32) -> i32 {
+    match unsafe { caps_opt() } {
+        Some(c) => match c.lookup(slot) {
+            Some((t, id)) => {
+                unsafe {
+                    *out_type = t;
+                    *out_id = id;
+                }
+                0
+            }
+            None => -1,
+        },
+        None => -2,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rust_ipc_channel_init() -> i32 {
+    unsafe {
+        let p: *mut Option<ipc::Channel> = core::ptr::addr_of_mut!(CHAN);
+        *p = Some(ipc::Channel::new(
+            core::ptr::addr_of_mut!(CH_STORAGE) as *mut ipc::Message,
+            NCHMSG,
+        ));
+    }
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn rust_ipc_send(cap: u32, buf: *const u8, len: u64) -> i32 {
+    let len = len as usize;
+    if len > ipc::MSG_PAYLOAD {
+        return -2;
+    }
+    let ch = match unsafe { (&mut *core::ptr::addr_of_mut!(CHAN)).as_mut() } {
+        Some(c) => c,
+        None => return -3,
+    };
+    let mut m = ipc::Message { cap, len: len as u16, data: [0; ipc::MSG_PAYLOAD] };
+    unsafe {
+        let dst = m.data.as_mut_ptr();
+        for i in 0..len {
+            *dst.add(i) = *buf.add(i);
+        }
+    }
+    match ch.send(&m) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rust_ipc_recv(buf: *mut u8, len_out: *mut u64, cap_out: *mut u32) -> i32 {
+    let ch = match unsafe { (&mut *core::ptr::addr_of_mut!(CHAN)).as_mut() } {
+        Some(c) => c,
+        None => return -3,
+    };
+    let mut m = ipc::Message { cap: 0, len: 0, data: [0; ipc::MSG_PAYLOAD] };
+    match ch.recv(&mut m) {
+        Ok(()) => {
+            // len 钳到载荷上限, 用裸指针拷: 下标索引会生成 bounds-check panic 桩
+            let n = (m.len as usize).min(ipc::MSG_PAYLOAD);
+            let src = m.data.as_ptr();
+            for i in 0..n {
+                unsafe { *buf.add(i) = *src.add(i); }
+            }
+            unsafe {
+                *len_out = m.len as u64;
+                *cap_out = m.cap;
+            }
+            0
+        }
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rust_vmo_create(pages: u64) -> i32 {
+    unsafe {
+        let fa = match fa_opt() {
+            Some(f) => f,
+            None => return -3,
+        };
+        let table = core::ptr::addr_of_mut!(VMO_TABLE) as *mut ipc::Vmo;
+        for i in 0..NVMO {
+            let slot = &mut *table.add(i);
+            if slot.refs == 0 && slot.npages == 0 {
+                match ipc::Vmo::create(fa, pages as usize) {
+                    Some(v) => {
+                        *slot = v;
+                        return i as i32;
+                    }
+                    None => return -1,
+                }
+            }
+        }
+        -2 // 表满
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rust_vmo_unref(handle: i32) -> i32 {
+    if handle < 0 || handle as usize >= NVMO {
+        return -1;
+    }
+    unsafe {
+        let fa = match fa_opt() {
+            Some(f) => f,
+            None => return -3,
+        };
+        let slot = &mut *(core::ptr::addr_of_mut!(VMO_TABLE) as *mut ipc::Vmo).add(handle as usize);
+        if slot.npages == 0 {
+            return -2;
+        }
+        let _ = slot.unpin(fa);
+        0
+    }
+}
+
+// ============================================================
+// 页表自举 / fork
+// ============================================================
+
+// 建自己的页表抄高半区+铺直映射然后切过去。max_phys=物理内存上限
+#[no_mangle]
+pub extern "C" fn rust_vm_bootstrap(max_phys: u64) -> i32 {
+    unsafe {
+        let fa = match fa_opt() {
+            Some(f) => f,
+            None => return -1,
+        };
+        match vmboot::build(fa, asm_read_cr3(), max_phys) {
+            Some(np) => {
+                asm_write_cr3(np);
+                frame::DIRECT = true;
+                0
+            }
+            None => -1,
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rust_user_aspace_new() -> u64 {
+    unsafe {
+        let fa = match fa_opt() {
+            Some(f) => f,
+            None => return u64::MAX,
+        };
+        aspace::new_user(fa, asm_read_cr3()).unwrap_or(u64::MAX)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rust_fork_copy(out_pages: *mut u64) -> u64 {
+    unsafe {
+        let fa = match fa_opt() {
+            Some(f) => f,
+            None => return u64::MAX,
+        };
+        let src = asm_read_cr3() & pagetable::PHYS_MASK;
+        let dst = match aspace::new_user(fa, src) {
+            Some(p) => p,
+            None => return u64::MAX,
+        };
+        let n = aspace::fork_deep(fa, src, dst);
+        if !out_pages.is_null() {
+            *out_pages = n as u64;
+        }
+        dst
     }
 }
 

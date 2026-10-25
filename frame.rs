@@ -110,6 +110,9 @@ pub trait FrameSource {
     fn frame_to_virt(&self, phys: u64) -> *mut u8;
 }
 
+pub const DIRECT_BASE: u64 = 0xFFFF_8800_0000_0000;
+pub static mut DIRECT: bool = false;
+
 impl FrameSource for FrameAllocator {
     fn alloc_frame(&mut self) -> Option<u64> {
         unsafe { self.alloc().map(|f| f as u64 * FRAME_SIZE) }
@@ -118,7 +121,11 @@ impl FrameSource for FrameAllocator {
         let _ = unsafe { self.free((phys / FRAME_SIZE) as usize) };
     }
     fn frame_to_virt(&self, phys: u64) -> *mut u8 {
-        phys as *mut u8
+        if unsafe { DIRECT } {
+            (phys + DIRECT_BASE) as *mut u8
+        } else {
+            phys as *mut u8
+        }
     }
 }
 
