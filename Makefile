@@ -32,7 +32,7 @@ ASM = nasm
 ASMFLAGS = -f elf64
 OBJCOPY = objcopy
 
-OBJS = kernel.o filesystem.mod.o mouse.mod.o desktop.mod.o png.mod.o font.o cpu.o idt.o interrupt.o pic.o console.o isr.o usermode.o
+OBJS = kernel.o filesystem.mod.o mouse.mod.o desktop.mod.o png.mod.o font.o cpu.o idt.o interrupt.o pic.o console.o isr.o usermode.o vmo.o
 
 all: kernel.elf
 
@@ -44,7 +44,7 @@ RUSTC ?= rustc
 RUST_OK := $(shell command -v rustc >/dev/null 2>&1 && echo yes)
 ifeq ($(RUST_OK),yes)
 OBJS += rust_kernel.o
-rust_kernel.o: rust_kernel.rs frame.rs kmem.rs vma.rs pagetable.rs vmboot.rs aspace.rs capability.rs ipc.rs task.rs syscall.rs userland.rs tmpfs.rs
+rust_kernel.o: rust_kernel.rs frame.rs kmem.rs vma.rs pagetable.rs vmboot.rs aspace.rs capability.rs ipc.rs task.rs syscall.rs userland.rs userland2.rs tmpfs.rs
 	$(RUSTC) --crate-type lib --target x86_64-unknown-none --edition 2021 \
 	    -C opt-level=2 --emit=obj -o $@ $<
 else
@@ -72,9 +72,12 @@ cpu.o: cpu.asm
 isr.o: isr.asm
 	$(ASM) $(ASMFLAGS) isr.asm -o isr.o
 
-# test 分支新增：Ring3 用户态全家桶（纯汇编）
+# test 分支新增：Ring3 用户态全家桶（纯汇编）+ VMO 共享内存（纯汇编）
 usermode.o: usermode.asm
 	$(ASM) $(ASMFLAGS) usermode.asm -o usermode.o
+
+vmo.o: vmo.asm
+	$(ASM) $(ASMFLAGS) vmo.asm -o vmo.o
 
 kernel.elf: $(OBJS) linker.ld
 	$(LD) -m elf_x86_64 -T linker.ld --no-pie -o kernel.elf $(OBJS)

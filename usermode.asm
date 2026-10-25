@@ -99,8 +99,13 @@ usermode_init:
 
 ; rcx = va, 沿 PML4→PDPT→PD 全路 U/S 置位 + NX 清位
 ; 末级 4K 页时整 PD 的 512 个 PTE 全放行（.data 掉哪页都不怕）
+global tss
+
 global syscall_int_entry
+extern vmo_syscall
 syscall_int_entry:
+    push qword 0                    ; err 垫平 — 帧统一成 22 槽, 和 IRQ 路径同布局
+    push qword 128                  ; int_no
     push rax
     push rbx
     push rcx
@@ -117,7 +122,20 @@ syscall_int_entry:
     push r14
     push r15
     mov rdi, rsp                    ; SyscallFrame*
-    call rust_syscall_entry
+    mov rax, [rdi + 112]            ; 系统调用号
+    cmp rax, 9
+    je .vmo
+    cmp rax, 10
+    je .vmo
+    call rust_syscall_entry         ; 返回新 rsp (0=原地)
+    jmp .swap
+.vmo:
+    call vmo_syscall
+.swap:
+    test rax, rax
+    jz .keep
+    mov rsp, rax                    ; yield/阻塞: 换栈切任务
+.keep:
     pop r15
     pop r14
     pop r13
@@ -133,6 +151,7 @@ syscall_int_entry:
     pop rcx
     pop rbx
     pop rax
+    add rsp, 16
     iretq
 
 global user_stack_top

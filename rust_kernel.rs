@@ -44,6 +44,8 @@ mod task;
 mod syscall;
 #[path = "userland.rs"]
 mod userland;
+#[path = "userland2.rs"]
+mod userland2;
 #[path = "tmpfs.rs"]
 mod tmpfs;
 
@@ -544,10 +546,12 @@ static mut CNT_A: u32 = 0;
 static mut CNT_B: u32 = 0;
 pub static mut PAYLOAD_TOKEN: u32 = 1; // rust_tasks_init 里发真值
 pub static mut PAYLOAD_EP: u32 = 1;    // 端点能力: IPC 通道的钥匙
+pub static mut PAYLOAD2_TOKEN: u32 = 1; // 第二个用户任务的画屏钥匙
 
 extern "C" {
     fn fb_putchar(cx: i32, cy: i32, c: u8, color: u32);
     fn fb_putpixel(x: i32, y: i32, color: u32);
+    fn vmo_init(); // vmo.asm: 共享内存池
     static user_stack_top: u8; // usermode.asm 的符号
 }
 
@@ -685,20 +689,52 @@ fn fb_cap_check(token: u32) -> bool {
     }
 }
 
-// int0x80 跳板落点: 全部逻辑在 syscall.rs
+// int0x80 跳板落点: 返回新 rsp (0=原地), yield/阻塞靠它换栈
 #[no_mangle]
-pub extern "C" fn rust_syscall_entry(frame: *mut syscall::SyscallFrame) {
+pub extern "C" fn rust_syscall_entry(frame: *mut syscall::SyscallFrame) -> u64 {
     unsafe {
         let f = &mut *frame;
         // 4 = IPC_SEND: rdi=端点令牌 rsi=用户缓冲 rdx=长度, 过能力门才进通道
         if f.rax == 4 {
             f.rax = if ep_cap_check(f.rdi as u32) {
                 let len = if f.rdx > 48 { 48 } else { f.rdx };
-                rust_ipc_send(f.rdi as u32, f.rsi as *const u8, len) as u64
+                let r = rust_ipc_send(f.rdi as u32, f.rsi as *const u8, len);
+                if r == 0 {
+                    // 喂饱了等通道的线程就把他叫醒
+                    if CHAN_WAITER != usize::MAX {
+                        let s: *mut task::Scheduler = core::ptr::addr_of_mut!(SCHED);
+                        (*s).wake(CHAN_WAITER);
+                        CHAN_WAITER = usize::MAX;
+                    }
+                }
+                r as u64
             } else {
                 u64::MAX
             };
-            return;
+            return 0;
+        }
+        // 5 = IPC_RECV (试探版): 收到就拷给用户, 空了就阻塞自己
+        if f.rax == 5 {
+            if !ep_cap_check(f.rdi as u32) {
+                f.rax = u64::MAX;
+                return 0;
+            }
+            let r = rust_ipc_recv(f.rsi as *mut u8, f.rdx as *mut u64, f.r8 as *mut u32);
+            if r == 0 {
+                f.rax = 0;
+                return 0;
+            }
+            // 通道空: 登记等待者, 阻塞, 切走
+            let s: *mut task::Scheduler = core::ptr::addr_of_mut!(SCHED);
+            CHAN_WAITER = (*s).cur_index();
+            (*s).block_cur();
+            f.rax = 0;
+            return rust_schedule(frame as u64);
+        }
+        // 12 = YIELD: 主动让出 CPU
+        if f.rax == 12 {
+            f.rax = 0;
+            return rust_schedule(frame as u64);
         }
         // 6/7/8 = 文件打开/写/读: 文件令牌 = grant(CAP_VMO, 文件号)
         if f.rax == 6 {
@@ -718,7 +754,7 @@ pub extern "C" fn rust_syscall_entry(frame: *mut syscall::SyscallFrame) {
             } else {
                 u64::MAX
             };
-            return;
+            return 0;
         }
         if f.rax == 7 || f.rax == 8 {
             // WRF/RDF: rdi=文件令牌 rsi=用户缓冲 rdx=长度
@@ -732,7 +768,7 @@ pub extern "C" fn rust_syscall_entry(frame: *mut syscall::SyscallFrame) {
                 Some((t, fid)) if t == syscall::CAP_FRAMEBUF => fid as usize,
                 _ => {
                     f.rax = u64::MAX;
-                    return;
+                    return 0;
                 }
             };
             let len = if f.rdx > 64 { 64 } else { f.rdx } as usize;
@@ -757,7 +793,7 @@ pub extern "C" fn rust_syscall_entry(frame: *mut syscall::SyscallFrame) {
                 }
                 f.rax = n as u64;
             }
-            return;
+            return 0;
         }
         let mut fb = syscall::Framebuffer {
             base: FB_BASE,
@@ -766,6 +802,7 @@ pub extern "C" fn rust_syscall_entry(frame: *mut syscall::SyscallFrame) {
             h: FB_H,
         };
         syscall::dispatch(f, fb_cap_check, &mut fb);
+        0
     }
 }
 
@@ -807,6 +844,7 @@ extern "C" fn thread_beta() -> ! {
 static mut STACK_C: [u8; 16384] = [0; 16384];
 static mut IPC_COUNT: u32 = 0;
 static mut IPC_SCRATCH: [u8; 64] = [0; 64];
+static mut CHAN_WAITER: usize = usize::MAX; // 阻塞在通道上的线程
 
 // fs 监视线程: 读 LOG 文件首字节上屏第 9 行, 爬升 = 用户写→内核存→内核读 全通
 static mut STACK_D: [u8; 16384] = [0; 16384];
@@ -839,6 +877,11 @@ extern "C" fn thread_ipc() -> ! {
             if r == 0 {
                 IPC_COUNT += 1;
                 draw_count(3, 8, IPC_COUNT, 0xFF00FF);
+            } else {
+                // 通道空: 阻塞自己, 载荷一发消息就被唤醒
+                let s: *mut task::Scheduler = core::ptr::addr_of_mut!(SCHED);
+                CHAN_WAITER = (*s).cur_index();
+                (*s).block_cur();
             }
         }
         for _ in 0..100000 {
@@ -859,7 +902,11 @@ pub extern "C" fn rust_tasks_init() -> i32 {
         let ep = rust_cap_grant(capability::CAP_ENDPOINT, 0);
         let te: *mut u32 = core::ptr::addr_of_mut!(PAYLOAD_EP);
         *te = ep;
+        let p2 = rust_cap_grant(syscall::CAP_FRAMEBUF, 0); // 任务B 的画屏钥匙
+        let t2: *mut u32 = core::ptr::addr_of_mut!(PAYLOAD2_TOKEN);
+        *t2 = p2;
         rust_ipc_channel_init();
+        vmo_init(); // 共享内存池上线
         // 帧缓冲参数从 bootboot 抄 (fb_ptr@0x28, scanline/width/height)
         let bb = &*(0xffff_ffff_ffe0_0000usize as *const u8);
         let p = bb as *const u8;
@@ -881,8 +928,17 @@ pub extern "C" fn rust_tasks_init() -> i32 {
         let ue = userland::user_payload_start as u64;
         let us = core::ptr::addr_of!(user_stack_top) as u64;
         let c = (*s).spawn_user(ue, us);
-        if a.is_none() || b.is_none() || c.is_none() || d.is_none() || e5.is_none() {
+        let u2 = userland2::user2_start as u64;
+        let c2 = (*s).spawn_user(u2, userland2::stack_top());
+        if a.is_none() || b.is_none() || c.is_none() || d.is_none() || e5.is_none() || c2.is_none()
+        {
             return -1;
+        }
+        // 每任务一条独立中断栈, 调度切换时写 TSS.RSP0 — ring3 帧不再互相踩
+        static mut IRQ_STACKS: [[u8; 4096]; 8] = [[0; 4096]; 8];
+        for i in 0..(*s).n {
+            let top = (core::ptr::addr_of_mut!(IRQ_STACKS) as u64) + ((i as u64) + 1) * 4096;
+            (*s).set_irq_top(i, top);
         }
         // 直映射已上线, 页表修补在 Rust 里做
         patch_user_region(ue);

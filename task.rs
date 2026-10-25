@@ -12,6 +12,7 @@ pub const UDATA: u64 = 0x23; // 0x20|3
 pub struct Task {
     pub rsp: u64, // 指向 gpr 块; 0 = 还没被打断过
     pub live: bool,
+    pub irq_top: u64, // 该任务的内核中断栈顶 (TSS.RSP0), 0 = 未分配
 }
 
 pub struct Scheduler {
@@ -22,7 +23,11 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub const fn new() -> Self {
-        Scheduler { t: [Task { rsp: 0, live: false }; 8], n: 0, cur: 0 }
+        Scheduler {
+            t: [Task { rsp: 0, live: false, irq_top: 0 }; 8],
+            n: 0,
+            cur: 0,
+        }
     }
 
     // 把正在跑的上下文（kernel_main/shell）收编为任务 0:
@@ -32,10 +37,18 @@ impl Scheduler {
             return usize::MAX;
         }
         let t = core::ptr::addr_of_mut!(self.t) as *mut Task;
-        *t.add(self.n) = Task { rsp: 0, live: true };
+        *t.add(self.n) = Task { rsp: 0, live: true, irq_top: 0 };
         self.n += 1;
         self.cur = 0;
         self.n - 1
+    }
+
+    // 每任务独立中断栈顶写入 TSS.RSP0 — ring3 任务共用一条 RSP0 会互相踩帧
+    pub unsafe fn set_irq_top(&mut self, idx: usize, top: u64) {
+        if idx < self.n {
+            let t = core::ptr::addr_of_mut!(self.t) as *mut Task;
+            (*t.add(idx)).irq_top = top;
+        }
     }
 
     // stack_top 必须页对齐; 入口永远不返回
@@ -62,12 +75,43 @@ impl Scheduler {
             }
         }
         self.cur = i;
+        // 切到 ring3 任务前换它自己的中断栈, 不然大家的帧在 RSP0 上互相踩
+        // (宿主测试里没有 tss 符号, cfg 隔离)
+        #[cfg(not(test))]
+        {
+            let top = (*t.add(i)).irq_top;
+            if top != 0 {
+                extern "C" {
+                    static tss: u8;
+                }
+                core::ptr::write_volatile((&raw const tss as u64 + 4) as *mut u64, top);
+            }
+        }
+        #[cfg(test)]
+        let _ = (*t.add(i)).irq_top;
         (*t.add(i)).rsp
     }
 
     // ring3 任务: 帧带用户段选择子, iretq 直接落用户态
     pub unsafe fn spawn_user(&mut self, entry: u64, stack_top: u64) -> Option<usize> {
         self.spawn_with(entry, stack_top, UCODE, UDATA)
+    }
+
+    pub fn cur_index(&self) -> usize {
+        self.cur
+    }
+
+    // 阻塞当前任务: 调度器跳过它, 直到 wake
+    pub unsafe fn block_cur(&mut self) {
+        let t = core::ptr::addr_of_mut!(self.t) as *mut Task;
+        (*t.add(self.cur)).live = false;
+    }
+
+    pub unsafe fn wake(&mut self, idx: usize) {
+        if idx < self.n {
+            let t = core::ptr::addr_of_mut!(self.t) as *mut Task;
+            (*t.add(idx)).live = true;
+        }
     }
 
     unsafe fn spawn_with(
@@ -91,7 +135,7 @@ impl Scheduler {
         *p.add(20) = stack_top - 8;
         *p.add(21) = ss;
         let t = core::ptr::addr_of_mut!(self.t) as *mut Task;
-        *t.add(self.n) = Task { rsp: frame, live: true };
+        *t.add(self.n) = Task { rsp: frame, live: true, irq_top: 0 };
         self.n += 1;
         Some(self.n - 1)
     }
@@ -174,6 +218,24 @@ mod tests {
             assert_eq!(*p.add(17), 0xBEEF);
             assert_eq!(*p.add(18), UCODE);
             assert_eq!(*p.add(21), UDATA);
+        }
+    }
+
+    #[test]
+    fn t6_block_and_wake() {
+        let (_s0, t0) = mkstack();
+        let (_s1, t1) = mkstack();
+        let mut s = Scheduler::new();
+        unsafe {
+            s.spawn(0x1000, t0);
+            s.spawn(0x2000, t1);
+            s.block_cur(); // 阻塞 0 号
+            assert_eq!(s.schedule(0x60_0000), t1 - 176);
+            // 只剩 1 号活着: 自己切给自己
+            assert_eq!(s.schedule(0x61_0000), 0x61_0000);
+            s.wake(0);
+            // 唤醒后回到 0 号首次被打断的现场
+            assert_eq!(s.schedule(0x62_0000), 0x60_0000);
         }
     }
 }

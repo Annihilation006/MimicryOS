@@ -21,6 +21,32 @@ fn token_ep() -> u64 {
 const SYS_IPC_SEND: u64 = 4;
 const SYS_OPEN: u64 = 6;
 const SYS_WRF: u64 = 7;
+const SYS_VMO_CREATE: u64 = 9;
+const SYS_YIELD: u64 = 12;
+
+// 建一块共享内存, 返回基址 (第二个用户任务从那儿读)
+fn vmo_create() -> u64 {
+    let ret: u64;
+    unsafe {
+        asm!(
+            "int 0x80",
+            in("rax") SYS_VMO_CREATE, in("rdi") 1,
+            lateout("rax") ret,
+        );
+    }
+    ret
+}
+
+// 主动让出 CPU
+fn yield_now() {
+    unsafe {
+        asm!(
+            "int 0x80",
+            in("rax") SYS_YIELD, in("rdi") token(),
+            lateout("rax") _,
+        );
+    }
+}
 
 // 往 IPC 通道丢一条消息
 fn ipc_send(data: &[u8]) -> i64 {
@@ -98,12 +124,19 @@ const PALETTE: [u32; 4] = [0x00FFFF, 0xFF00FF, 0xFFFFFF, 0x00FF00];
 #[no_mangle]
 pub extern "C" fn user_payload_start() -> ! {
     let ftok = sys_open(b"LOG"); // 文件能力令牌, 绑着 LOG
+    let vbase = vmo_create(); // 共享内存: 计数器放这儿给任务B看
     let mut phase: usize = 0;
     loop {
         // 把相位写进文件, 内核 fs 监视线程读出来上屏
         let fill = (phase as u8) % 200 + 1;
         let buf = [fill; 16];
         let _ = wrf(ftok, &buf);
+        // 共享内存计数器: 任务B 读到就会画出来
+        if vbase != u64::MAX {
+            unsafe {
+                core::ptr::write_volatile(vbase as *mut u64, phase as u64);
+            }
+        }
         // 擦旧下划线
         let mut x = 27i64;
         while x < 100 {
@@ -126,6 +159,7 @@ pub extern "C" fn user_payload_start() -> ! {
         // 跟内核里的 IPC 服务线程打个招呼: 发相位数过去
         let msg = (phase as u64).to_le_bytes();
         let _ = ipc_send(&msg);
+        yield_now();
         let mut spin = 2_000_000i64;
         while spin > 0 {
             core::hint::spin_loop();
