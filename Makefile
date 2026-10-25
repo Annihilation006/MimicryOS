@@ -36,6 +36,21 @@ OBJS = kernel.o filesystem.mod.o mouse.mod.o desktop.mod.o png.mod.o font.o cpu.
 
 all: kernel.elf
 
+# ── test 分支新增：Rust(no_std) 对象 ─────────────────────────────
+# 检测到 rustc 时编入 rust_kernel.o（no_std，与 C/asm 同链一个 ELF）；
+# 未安装则打印提示并跳过，保证在只有 C 工具链的机器上仍可完整构建。
+# 注意：本块必须位于 all: 之后，避免 rust_kernel.o 规则抢占默认目标。
+RUSTC ?= rustc
+RUST_OK := $(shell command -v rustc >/dev/null 2>&1 && echo yes)
+ifeq ($(RUST_OK),yes)
+OBJS += rust_kernel.o
+rust_kernel.o: rust_kernel.rs
+	$(RUSTC) --crate-type lib --target x86_64-unknown-none --edition 2021 \
+	    -C opt-level=2 --emit=obj -o $@ $<
+else
+$(info [test] 未检测到 rustc，跳过 Rust 对象（安装 rustup 后自动启用）)
+endif
+
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 

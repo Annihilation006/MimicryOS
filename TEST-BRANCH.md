@@ -23,11 +23,14 @@
 |---|---|
 | `cpu.asm` | x86_64 汇编地基：端口 I/O、CLI/STI/HLT、CR0/2/3/4 读写、CPUID、RDTSC、MSR 读写。全部 `asm_` 前缀，零符号冲突 |
 | `cpu.h` | 上述原语的 C 声明，供 C / Rust 两侧调用 |
+| `rust_kernel.rs` | Rust(no_std) 第一个编译单元：`rust_cpu_report()` 经 `extern "C"` 同时调用既有 C 的 `fb_print` 与 `cpu.asm` 原语，验证三方混合链接 |
 | `TEST-BRANCH.md` | 本文件 |
 
-后续计划：物理帧管理、VMA、以及 Rust 构建骨架（`rust-toolchain` +
-`no_std` crate 与现有 Makefile 的混合构建）。每一步都保持
-"不动已有代码、只做加法"。
+构建说明：`make` 即可。装有 rustup（目标 `x86_64-unknown-none`）的机器会
+自动编入 Rust 对象；没有 rustc 的机器会打印提示并跳过，C 侧构建不受影响。
+
+后续计划：物理帧管理（Bitmap）、VMA、Rust 侧逐步扩大。每一步都保持
+"不动已有代码、只做加法"；`rust_cpu_report()` 何时接线调用，等 main 作者点头。
 
 ## 署名约定
 
