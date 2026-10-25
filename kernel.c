@@ -18,6 +18,9 @@ typedef unsigned char uint8_t;
 typedef short int16_t;
 
 #include "bootboot.h"
+#include "idt.h"
+#include "pic.h"
+#include "console.h"
 
 #define NULL ((void*)0)
 void fb_print(const char* str);
@@ -634,7 +637,7 @@ char keyboard_read(void) {
  * touch/write/size/rm/type/reboot/shutdown。 */
 void shell(void) {
     cursor_x = 0;
-    cursor_y = 3;
+    /* [test] 原来写死 cursor_y=3, 横幅多打几行就叠字, 改成跟光标走 */
     user_prompt();
 
     char cmd[256];
@@ -840,21 +843,58 @@ void boot_animation(void) {
 
 /* 内核主流程：初始化堆 → 注册模块 → 开机动画 → 进入 Shell。
  * desktop 模块暂未接线（render 函数未实现），故此处注释掉注册。 */
+
+/* [test] PIT 100Hz 的 tick 计数, 中断上线的活体证据:
+ * 右上角三位数计数器每 32 tick 刷一次, 跳动 = IRQ0 活着 */
+static volatile unsigned int pit_ticks = 0;
+static void pit_tick(interrupt_frame_t* f) {
+    (void)f;
+    pit_ticks++;
+    if ((pit_ticks & 31) == 0) {
+        unsigned int t = pit_ticks;
+        int cols = (int)(bootboot.fb_width / 9);
+        for (int x = 0; x < 27; x++)
+            for (int y = 0; y < 16; y++)
+                fb_putpixel((cols - 3) * 9 + x, y, 0x000000);
+        fb_putchar(cols - 3, 0, '0' + (t / 100) % 10, 0x00FF00);
+        fb_putchar(cols - 2, 0, '0' + (t / 10) % 10, 0x00FF00);
+        fb_putchar(cols - 1, 0, '0' + t % 10, 0x00FF00);
+    }
+}
+
 void kernel_main(void) {
     fb = bootboot.fb_ptr;
     fb_fill(0x000000);
-    
+
     memory_init();
     module_register(&filesystem_module);
     module_register(&mouse_module);
     // module_register(&desktop_module);
     module_register(&png_module);
     module_register(&user_module);
-    
+
     boot_animation();
+
+    /* [test] 中断上线: IDT + PIC 重映射 + PIT 定时器
+     * 开机动画期间 cli 着, 这里装好再 sti */
+    idt_init();
+    pic_remap();
+    register_interrupt_handler(32, pit_tick);
+    pic_clear_mask(0);          /* IRQ0 计时器 */
+    outb(0x43, 0x36);           /* 通道0 方波 */
+    outb(0x40, 11932 & 0xFF);   /* 1193182Hz / 100Hz */
+    outb(0x40, 11932 >> 8);
+    enable_interrupts();
+    for (volatile long w = 0; w < 50000000; w++);
+    fb_print("[test] interrupts ");
+    if (pit_ticks > 10) fb_print("ALIVE, ticks=");
+    else fb_print("DEAD, ticks=");
+    print_int((int)pit_ticks);
+    fb_print("\n");
+
     fb_print("MimicryOS Shell\n");
     fb_print("Type help for commands\n");
-    
+
     shell();
 }
 

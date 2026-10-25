@@ -32,7 +32,7 @@ ASM = nasm
 ASMFLAGS = -f elf64
 OBJCOPY = objcopy
 
-OBJS = kernel.o filesystem.mod.o mouse.mod.o desktop.mod.o png.mod.o font.o cpu.o
+OBJS = kernel.o filesystem.mod.o mouse.mod.o desktop.mod.o png.mod.o font.o cpu.o idt.o interrupt.o pic.o console.o isr.o
 
 all: kernel.elf
 
@@ -67,6 +67,10 @@ font.o: font.psf
 # test 分支新增：x86_64 汇编 CPU 原语（端口IO/控制寄存器/CPUID/RDTSC/MSR）
 cpu.o: cpu.asm
 	$(ASM) $(ASMFLAGS) cpu.asm -o cpu.o
+
+# test 分支新增：中断桩（48 个 isr/irq + idt_load）
+isr.o: isr.asm
+	$(ASM) $(ASMFLAGS) isr.asm -o isr.o
 
 kernel.elf: $(OBJS) linker.ld
 	$(LD) -m elf_x86_64 -T linker.ld --no-pie -o kernel.elf $(OBJS)

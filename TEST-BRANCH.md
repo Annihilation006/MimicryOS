@@ -30,7 +30,15 @@
 | `tools/test_root.rs` | 宿主测试入口：`rustc --edition 2021 --test` 一把跑全部 26 项单测 |
 | `tools/ci.sh` | 五段 CI：单测 → 混合构建 → 打包 → QEMU 启动 → 屏幕点亮检查 |
 | `docs/design.md` | 技术事实与路线图（架构图、模块契约、C 接口清单） |
+| `idt.h` / `idt.c` | 中断描述符表（原 32 位版在长模式必崩，按原作者骨架修正为 16 字节门） |
+| `isr.asm` | 48 个中断桩 + 公共入口 + idt_load（补完 WIP 里缺失的部分） |
+| `interrupt.c` / `pic.c` / `pic.h` | 异常/IRQ 分发器与 8259A 重映射（原作者 WIP 原样移植） |
+| `console.c` | print/print_hex 薄壳（原版直写 0xB8000 在 BOOTBOOT 图形模式不存在，改走 fb_print） |
 | `TEST-BRANCH.md` | 本文件 |
+
+**中断现状**：IDT + PIC 重映射 + PIT 100Hz 已接线 kernel_main，QEMU 实测
+IRQ0 持续触发（右上角绿色 tick 计数器跳动）。原作者的 WIP 快照在
+`wip-interrupt` 分支（fab890e），本分支的中断实现以其骨架为底补完。
 
 **给 C 侧的直接接口**（完整清单与 flags 位定义见 `docs/design.md`）：
 `rust_mem_init / rust_frame_alloc / rust_frame_free / rust_kmem_init /
