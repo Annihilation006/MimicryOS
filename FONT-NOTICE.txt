@@ -1,0 +1,44 @@
+MimicryOS — 字体来源与许可声明
+================================
+
+文件：font.psf（PSF2 位图字体，8x16，256 字形，4128 字节）
+
+原始字体：Spleen 8x16
+  - 官方仓库：https://github.com/fcambus/spleen
+  - 本仓库 tools/spleen-8x16.bdf 为 Tecate/bitmap-fonts 项目中的 8x16 副本：
+    https://github.com/Tecate/bitmap-fonts/blob/master/bitmap/spleen/spleen-8x16.bdf
+
+许可：BSD-2-Clause
+  - Copyright (c) 2018-2026 Frederic Cambus
+  - Spleen 官方以 BSD 2-Clause 许可证发布，详见：
+    https://github.com/fcambus/spleen/blob/master/LICENSE
+  - BSD-2-Clause 为宽松许可证，允许嵌入、修改与再分发（须保留版权与许可声明）。
+
+转换：tools/genfont.py 将 spleen-8x16.bdf 解析为 256 个字形（0x00–0xFF 全覆盖，
+      缺失编码填 0），输出 PSF2 格式的 font.psf；Makefile 用 objcopy 将 font.psf
+      封装为 font.o 并链接进 kernel.elf。
+完整许可协议（BSD 2-Clause License）
+==================================================
+Copyright (c) 2018-2026, Frederic Cambus
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
