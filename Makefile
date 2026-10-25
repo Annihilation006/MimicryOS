@@ -44,7 +44,7 @@ RUSTC ?= rustc
 RUST_OK := $(shell command -v rustc >/dev/null 2>&1 && echo yes)
 ifeq ($(RUST_OK),yes)
 OBJS += rust_kernel.o
-rust_kernel.o: rust_kernel.rs frame.rs
+rust_kernel.o: rust_kernel.rs frame.rs kmem.rs vma.rs pagetable.rs
 	$(RUSTC) --crate-type lib --target x86_64-unknown-none --edition 2021 \
 	    -C opt-level=2 --emit=obj -o $@ $<
 else

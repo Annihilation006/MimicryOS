@@ -21,16 +21,21 @@
 
 | 文件 | 说明 |
 |---|---|
-| `cpu.asm` | x86_64 汇编地基：端口 I/O、CLI/STI/HLT、CR0/2/3/4 读写、CPUID、RDTSC、MSR 读写。全部 `asm_` 前缀，零符号冲突 |
-| `cpu.h` | 上述原语的 C 声明，供 C / Rust 两侧调用 |
-| `rust_kernel.rs` | Rust(no_std) 编译单元：`rust_cpu_report()` 验证三方互操作；`rust_mem_init()` 解析 BOOTBOOT 内存图初始化物理帧分配器 |
-| `frame.rs` | 物理帧位图分配器（02-memory.md 第一步）：next-fit、double-free 防护、越界截断；自带 7 项宿主单测（`rustc --test frame.rs`） |
+| `cpu.asm` / `cpu.h` | x86_64 汇编地基：端口 I/O、CLI/STI/HLT、CR0/2/3/4、CPUID、RDTSC、MSR、INVLPG。全部 `asm_` 前缀，零符号冲突 |
+| `rust_kernel.rs` | Rust(no_std) 编译单元与模块装配：CPU 桥、BOOTBOOT 内存图解析、内核侧 statics 与 C 接口 |
+| `frame.rs` | 物理帧位图分配器 + FrameSource 供给接口（保守放开策略） |
+| `kmem.rs` | 帧供给的内核小对象池（K&R 空闲链表，相邻合并） |
+| `vma.rs` | 虚拟内存区域簿记（有序链表，mmap/munmap 语义，256 节点池） |
+| `pagetable.rs` | x86_64 四级页表 map/unmap/translate（作用于当前 CR3） |
+| `tools/test_root.rs` | 宿主测试入口：`rustc --edition 2021 --test` 一把跑全部 26 项单测 |
+| `tools/ci.sh` | 五段 CI：单测 → 混合构建 → 打包 → QEMU 启动 → 屏幕点亮检查 |
+| `docs/design.md` | 技术事实与路线图（架构图、模块契约、C 接口清单） |
 | `TEST-BRANCH.md` | 本文件 |
 
-**给 C 侧的直接接口**：`rust_mem_init()`（初始化，返回空闲帧数）、
-`rust_frame_alloc()`（成功返回帧号，失败 `u64::MAX`）、
-`rust_frame_free(frame_no)`（0=成功，-1=参数错误）、`rust_mem_report()`
-（经 fb_print 打印统计）。main 分支将来做分页时可直接调用，无需了解 Rust。
+**给 C 侧的直接接口**（完整清单与 flags 位定义见 `docs/design.md`）：
+`rust_mem_init / rust_frame_alloc / rust_frame_free / rust_kmem_init /
+rust_vma_init / rust_vma_mmap / rust_vma_munmap / rust_map_page /
+rust_unmap_page / rust_mem_report / rust_cpu_report`。
 
 构建说明：`make` 即可。装有 rustup（目标 `x86_64-unknown-none`）的机器会
 自动编入 Rust 对象；没有 rustc 的机器会打印提示并跳过，C 侧构建不受影响。

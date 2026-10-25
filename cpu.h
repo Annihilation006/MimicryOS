@@ -34,6 +34,7 @@ unsigned long long asm_read_cr2(void);   /* 最近一次缺页的线性地址 */
 unsigned long long asm_read_cr3(void);   /* 当前页表物理基址 */
 unsigned long long asm_read_cr4(void);
 void asm_write_cr3(unsigned long long val);
+void asm_invlpg(unsigned long long addr);   /* 失效单页 TLB 项 */
 
 /* ---- CPUID ----
  * out[0..3] 依次为 EAX/EBX/ECX/EDX。

@@ -132,6 +132,14 @@ asm_rdtsc:                      ; unsigned long long asm_rdtsc(void)
     or rax, rdx
     ret
 
+; ---------------- 页表维护 ----------------
+; unmap 后必须失效 TLB 项，否则旧映射在部分 CPU 上仍可见。
+
+global asm_invlpg
+asm_invlpg:                     ; void asm_invlpg(unsigned long long addr)
+    invlpg [rdi]
+    ret
+
 ; ---------------- 模型特定寄存器 MSR ----------------
 ; EFER(APIC/长模式控制)、LAPIC 基址等都住在 MSR 里，
 ; 启用 APIC 定时器前必须先能读写它。

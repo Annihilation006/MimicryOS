@@ -98,6 +98,30 @@ impl FrameAllocator {
     }
 }
 
+/// 物理帧供给接口：让页表/堆等上层设施与具体分配器解耦，
+/// 内核侧由 FrameAllocator 实现，宿主测试用假内存竞技场实现。
+pub trait FrameSource {
+    /// 返回物理地址（帧号 × 4096），无空闲返回 None。
+    fn alloc_frame(&mut self) -> Option<u64>;
+    fn free_frame(&mut self, phys: u64);
+    /// 取得该物理帧当前可写的虚拟地址。
+    /// 前提（内核侧）：BOOTBOOT 建立的低地址身份映射仍然有效，
+    /// phys == virt；内核建立自己的直映射区后在此换算。
+    fn frame_to_virt(&self, phys: u64) -> *mut u8;
+}
+
+impl FrameSource for FrameAllocator {
+    fn alloc_frame(&mut self) -> Option<u64> {
+        unsafe { self.alloc().map(|f| f as u64 * FRAME_SIZE) }
+    }
+    fn free_frame(&mut self, phys: u64) {
+        let _ = unsafe { self.free((phys / FRAME_SIZE) as usize) };
+    }
+    fn frame_to_virt(&self, phys: u64) -> *mut u8 {
+        phys as *mut u8
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

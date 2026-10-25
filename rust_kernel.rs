@@ -2,12 +2,17 @@
 // MimicryOS test 分支 · Rust 内核侧编译单元
 // 维护：homo-ai (Hugo_YuGuo)
 //
-// 已具备：
-//   1. 三方互操作桥（rust_cpu_report：Rust→C fb_print / Rust→asm 原语）
-//   2. 物理帧管理（rust_mem_init：解析 BOOTBOOT 内存图 → 位图分配器，
-//      详见 frame.rs 与设计文档 02-memory.md）
-//      - rust_frame_alloc / rust_frame_free：C 侧也可直接调用的分配接口
-//      - rust_mem_report：经 fb_print 输出内存统计
+// 模块装配：
+//   frame      物理帧位图分配器（含 FrameSource 供给接口）
+//   kmem       帧供给的内核小对象池（VMA 节点等自用）
+//   vma        虚拟内存区域簿记（有序链表，演进目标 BTree）
+//   pagetable  x86_64 四级页表 map/unmap/translate
+//
+// C 侧可直接调用的接口（声明见 TEST-BRANCH.md）：
+//   rust_mem_init() / rust_frame_alloc() / rust_frame_free()
+//   rust_mem_report() / rust_kmem_init(frames)
+//   rust_map_page() / rust_unmap_page()
+//   rust_vma_init() / rust_vma_mmap() / rust_vma_munmap()
 //
 // 本文件不接管入口、不改动任何既有 C 代码；
 // 上述函数何时接线调用，等 main 作者点头（见 TEST-BRANCH.md）。
@@ -19,12 +24,17 @@
 
 #[path = "frame.rs"]
 mod frame;
+#[path = "kmem.rs"]
+mod kmem;
+#[path = "pagetable.rs"]
+mod pagetable;
+#[path = "vma.rs"]
+mod vma;
 
 use core::panic::PanicInfo;
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    // 裸机环境暂无 panic 输出通道；待与 fb_print 接线后补诊断信息
     loop {}
 }
 
@@ -38,14 +48,13 @@ extern "C" {
     fn asm_read_cr0() -> u64;
     fn asm_read_cr3() -> u64;
     fn asm_cpuid(leaf: u32, subleaf: u32, out: *mut u32);
+    fn asm_invlpg(addr: u64);
 }
 
 // ============================================================
-// 第一部分：CPU 互操作桥（验证三方混合链接）
+// CPU 互操作桥（验证三方混合链接）
 // ============================================================
 
-/// 读取并回显关键 CPU 状态，验证 Rust → C / Rust → asm 桥可用。
-/// 返回 CR0 当前值，便于调用方断言（分页位 PE/PG 等）。
 #[no_mangle]
 pub extern "C" fn rust_cpu_report() -> u64 {
     let cr0 = unsafe { asm_read_cr0() };
@@ -67,29 +76,26 @@ pub extern "C" fn rust_cpu_report() -> u64 {
         fb_print(b"\n\0".as_ptr());
     }
 
-    // cr3 当前仅作演示读取；后续物理帧/页表初始化会正式使用
     let _ = cr3;
     cr0
 }
 
 // ============================================================
-// 第二部分：物理帧管理（02-memory.md）
+// 物理帧管理（02-memory.md）
 // ============================================================
-
-/* ---- BOOTBOOT 协议最小子集（完整定义见 bootboot.h，bzt，MIT）---- */
 
 const BOOTBOOT_INFO_ADDR: usize = 0xffff_ffff_ffe0_0000;
 
 #[repr(C, packed)]
 struct MMapEnt {
     ptr: u64,
-    size: u64, // 低 4 位是类型，其余为字节数（16 字节对齐单位）
+    size: u64, // 低 4 位是类型，其余为字节数
 }
 
 #[repr(C, packed)]
 struct Bootboot {
-    magic: [u8; 4],      // "BOOT"
-    size: u32,           // 结构体总长（含变长 mmap 表）
+    magic: [u8; 4],
+    size: u32,
     protocol: u8,
     fb_type: u8,
     numcores: u16,
@@ -103,15 +109,12 @@ struct Bootboot {
     fb_width: u32,
     fb_height: u32,
     fb_scanline: u32,
-    _arch: [u8; 64],     // 平台相关区（此处不用）
-    mmap: [MMapEnt; 1],  // 变长数组首地址
+    _arch: [u8; 64],
+    mmap: [MMapEnt; 1],
 }
 
-const MMAP_USED: u64 = 0;
 const MMAP_FREE: u64 = 1;
 
-/* 位图容量：管理上限 4 GiB 物理内存 = 1M 帧 = 16384 个 u64 = 128 KiB。
- * 静态放 .bss，无堆依赖；将来机器内存超限时改为按内存图动态截取。 */
 const MAX_FRAMES: usize = 1 << 20;
 const BM_WORDS: usize = MAX_FRAMES / frame::WORD_BITS;
 
@@ -124,9 +127,7 @@ unsafe fn fa_opt() -> Option<&'static mut frame::FrameAllocator> {
 }
 
 /// 解析 BOOTBOOT 内存图并初始化物理帧分配器。
-/// 返回空闲帧总数；BOOTBOOT magic 校验失败返回 usize::MAX。
-/// 保守策略：默认全占用，仅 MMAP_FREE 区段放开，且跳过第 0 帧
-/// （实模式 IVT / BIOS 数据区，历史包袱谁用谁知道）。
+/// 返回空闲帧总数；magic 校验失败返回 usize::MAX。
 #[no_mangle]
 pub extern "C" fn rust_mem_init() -> usize {
     unsafe {
@@ -143,7 +144,6 @@ pub extern "C" fn rust_mem_init() -> usize {
         );
         fa.init_all_used();
 
-        // mmap 表从结构体第 128 字节开始，到 bootboot.size 为止
         let hdr = 128usize;
         let ent = core::mem::size_of::<MMapEnt>();
         let nents = ((bb.size as usize).saturating_sub(hdr)) / ent;
@@ -153,14 +153,14 @@ pub extern "C" fn rust_mem_init() -> usize {
             let e: MMapEnt = core::ptr::read(first.add(i));
             let typ = e.size & 0xF;
             let bytes = e.size & !0xFu64;
-            if typ != MMAP_FREE || bytes == 0 || typ == MMAP_USED {
+            if typ != MMAP_FREE || bytes == 0 {
                 continue;
             }
             let start = e.ptr;
             let end = e.ptr.saturating_add(bytes);
             let f0 = ((start + frame::FRAME_SIZE - 1) / frame::FRAME_SIZE) as usize;
             let f1 = ((end + frame::FRAME_SIZE - 1) / frame::FRAME_SIZE) as usize;
-            let f0 = f0.max(1); // 跳过第 0 帧
+            let f0 = f0.max(1); // 跳过第 0 帧（IVT/BIOS 数据区）
             if f1 > f0 {
                 fa.mark_free_range(f0, f1 - f0);
             }
@@ -173,7 +173,6 @@ pub extern "C" fn rust_mem_init() -> usize {
     }
 }
 
-/// C 侧亦可直接调用的分配接口：成功返回物理帧号，失败返回 u64::MAX。
 #[no_mangle]
 pub extern "C" fn rust_frame_alloc() -> u64 {
     match unsafe { fa_opt() } {
@@ -185,7 +184,6 @@ pub extern "C" fn rust_frame_alloc() -> u64 {
     }
 }
 
-/// C 侧释放接口：0=成功，-1=未初始化/越界/重复释放。
 #[no_mangle]
 pub extern "C" fn rust_frame_free(frame_no: u64) -> i32 {
     match unsafe { fa_opt() } {
@@ -200,7 +198,118 @@ pub extern "C" fn rust_frame_free(frame_no: u64) -> i32 {
     }
 }
 
-/* 无 std 的十进制格式化（fb_print 只吃以 \0 结尾的字符串） */
+// ============================================================
+// 内核小对象池 + VMA 簿记
+// ============================================================
+
+static mut KMEM: kmem::Kmem = kmem::Kmem::new();
+
+/// 内核 VMA 竞技场：0xFFFF_8800_0000_0000 起 8TiB，
+/// 避开 BOOTBOOT 保留区（fb / mmio / bootboot 结构 / 内核本体）。
+const KERN_VMA_START: u64 = 0xFFFF_8800_0000_0000;
+const KERN_VMA_END: u64 = 0xFFFF_9000_0000_0000;
+
+static mut VMA_NODES: [vma::VmaNode; 256] = [vma::VmaNode::EMPTY; 256];
+static mut VMA: Option<vma::VmaManager> = None;
+
+unsafe fn vma_opt() -> Option<&'static mut vma::VmaManager> {
+    let p: *mut Option<vma::VmaManager> = core::ptr::addr_of_mut!(VMA);
+    (*p).as_mut()
+}
+
+/// 从物理帧分配器取 n 帧供给小对象池，返回新增字节数。
+#[no_mangle]
+pub extern "C" fn rust_kmem_init(frames: u64) -> usize {
+    unsafe {
+        let k: *mut kmem::Kmem = core::ptr::addr_of_mut!(KMEM);
+        match fa_opt() {
+            Some(fa) => (*k).add_frames(fa, frames as usize),
+            None => 0,
+        }
+    }
+}
+
+/// 初始化内核 VMA 管理器（节点池 256 个，.bss 静态供给）。
+#[no_mangle]
+pub extern "C" fn rust_vma_init() -> i32 {
+    unsafe {
+        let pool = core::ptr::addr_of_mut!(VMA_NODES) as *mut vma::VmaNode;
+        let p: *mut Option<vma::VmaManager> = core::ptr::addr_of_mut!(VMA);
+        *p = Some(vma::VmaManager::new(pool, 256, KERN_VMA_START, KERN_VMA_END));
+        0
+    }
+}
+
+/// 在内核 VMA 竞技场切一块（len 字节，页对齐化），返回起始虚拟地址。
+#[no_mangle]
+pub extern "C" fn rust_vma_mmap(len: u64, flags: u64) -> u64 {
+    match unsafe { vma_opt() } {
+        Some(m) => m.mmap(len, flags).unwrap_or(u64::MAX),
+        None => u64::MAX,
+    }
+}
+
+/// 取消一块 VMA 簿记；返回 0=有变化，-1=无变化/未初始化。
+#[no_mangle]
+pub extern "C" fn rust_vma_munmap(start: u64, len: u64) -> i32 {
+    match unsafe { vma_opt() } {
+        Some(m) => {
+            if m.munmap(start, len) {
+                0
+            } else {
+                -1
+            }
+        }
+        None => -1,
+    }
+}
+
+// ============================================================
+// 页表操作（作用于当前 CR3 指向的地址空间）
+// ============================================================
+
+/// flags 位定义见 pagetable.rs（PTE_WRITABLE=1<<1, PTE_USER=1<<2,
+/// PTE_NO_EXEC=1<<63），C 侧传原始位组合即可。
+#[no_mangle]
+pub extern "C" fn rust_map_page(vaddr: u64, paddr: u64, flags: u64) -> i32 {
+    unsafe {
+        let pml4 = asm_read_cr3() & pagetable::PHYS_MASK;
+        let fa = match fa_opt() {
+            Some(f) => f,
+            None => return -1,
+        };
+        match pagetable::map_page(fa, pml4, vaddr, paddr, flags) {
+            Ok(()) => {
+                asm_invlpg(vaddr);
+                0
+            }
+            Err(_) => -1,
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rust_unmap_page(vaddr: u64) -> i32 {
+    unsafe {
+        let pml4 = asm_read_cr3() & pagetable::PHYS_MASK;
+        let fa = match fa_opt() {
+            Some(f) => f,
+            None => return -1,
+        };
+        match pagetable::unmap_page(fa, pml4, vaddr) {
+            Ok(()) => {
+                asm_invlpg(vaddr);
+                0
+            }
+            Err(_) => -1,
+        }
+    }
+}
+
+// ============================================================
+// 报告输出
+// ============================================================
+
 fn fmt_dec(mut v: u64, out: &mut [u8; 20]) -> usize {
     if v == 0 {
         out[0] = b'0';
@@ -219,7 +328,6 @@ fn fmt_dec(mut v: u64, out: &mut [u8; 20]) -> usize {
     n
 }
 
-/// 经既有 fb_print 输出内存统计（帧粒度统计，KiB 单位换算给调用方看）。
 #[no_mangle]
 pub extern "C" fn rust_mem_report() {
     let (free, total) = match unsafe { fa_opt() } {
@@ -230,7 +338,6 @@ pub extern "C" fn rust_mem_report() {
     let mut pos = 0;
 
     let mut put = |s: &[u8]| {
-        // 闭包捕获可变 pos —— 简单起见用显式循环展开
         for &b in s {
             if pos < line.len() {
                 line[pos] = b;
