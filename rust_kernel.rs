@@ -541,11 +541,23 @@ static mut STACK_B: [u8; 16384] = [0; 16384];
 static mut CNT_A: u32 = 0;
 static mut CNT_B: u32 = 0;
 pub static mut PAYLOAD_TOKEN: u32 = 1; // rust_tasks_init 里发真值
+pub static mut PAYLOAD_EP: u32 = 1;    // 端点能力: IPC 通道的钥匙
 
 extern "C" {
     fn fb_putchar(cx: i32, cy: i32, c: u8, color: u32);
     fn fb_putpixel(x: i32, y: i32, color: u32);
     static user_stack_top: u8; // usermode.asm 的符号
+}
+
+// 端点能力检查: IPC 系统调用的门票
+fn ep_cap_check(token: u32) -> bool {
+    unsafe {
+        let c: *mut Option<capability::CSpace> = core::ptr::addr_of_mut!(CAPS);
+        match (*c).as_mut() {
+            Some(cs) => matches!(cs.lookup(token), Some((t, _)) if t == capability::CAP_ENDPOINT),
+            None => false,
+        }
+    }
 }
 
 // ---- 帧缓冲参数 (rust_tasks_init 从 bootboot 抄) ----
@@ -609,6 +621,7 @@ unsafe fn tlb_flush() {
     asm_write_cr3(c);
 }
 
+#[allow(dead_code)]
 // 调试探针: 打 cr3 + 四级表项 (排查完就删)
 unsafe fn pte_dump(va: u64, tag: &[u8]) {
     let cr3 = asm_read_cr3() & 0x000F_FFFF_FFFF_F000;
@@ -672,6 +685,16 @@ fn fb_cap_check(token: u32) -> bool {
 pub extern "C" fn rust_syscall_entry(frame: *mut syscall::SyscallFrame) {
     unsafe {
         let f = &mut *frame;
+        // 4 = IPC_SEND: rdi=端点令牌 rsi=用户缓冲 rdx=长度, 过能力门才进通道
+        if f.rax == 4 {
+            f.rax = if ep_cap_check(f.rdi as u32) {
+                let len = if f.rdx > 48 { 48 } else { f.rdx };
+                rust_ipc_send(f.rdi as u32, f.rsi as *const u8, len) as u64
+            } else {
+                u64::MAX
+            };
+            return;
+        }
         let mut fb = syscall::Framebuffer {
             base: FB_BASE,
             scan: FB_SCAN,
@@ -716,15 +739,45 @@ extern "C" fn thread_beta() -> ! {
     }
 }
 
+// IPC 服务线程: 从通道收消息, 往返一次计一次数
+static mut STACK_C: [u8; 16384] = [0; 16384];
+static mut IPC_COUNT: u32 = 0;
+static mut IPC_SCRATCH: [u8; 64] = [0; 64];
+
+extern "C" fn thread_ipc() -> ! {
+    loop {
+        unsafe {
+            let mut len_out: u64 = 0;
+            let mut cap_out: u32 = 0;
+            let r = rust_ipc_recv(
+                IPC_SCRATCH.as_mut_ptr(),
+                &mut len_out,
+                &mut cap_out,
+            );
+            if r == 0 {
+                IPC_COUNT += 1;
+                draw_count(3, 8, IPC_COUNT, 0xFF00FF);
+            }
+        }
+        for _ in 0..100000 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
 // kernel_main 里 enable_interrupts 之前调一次
 #[no_mangle]
 pub extern "C" fn rust_tasks_init() -> i32 {
     unsafe {
-        // 能力系统上线, 发一把帧缓冲钥匙 (slot 0 空, 分配从栈顶走, 真槽位传载荷)
+        // 能力系统上线, 发两把钥匙: 帧缓冲(VMO) + IPC 端点(ENDPOINT)
         rust_cap_init();
         let tok = rust_cap_grant(syscall::CAP_FRAMEBUF, 0);
         let tp: *mut u32 = core::ptr::addr_of_mut!(PAYLOAD_TOKEN);
         *tp = tok;
+        let ep = rust_cap_grant(capability::CAP_ENDPOINT, 0);
+        let te: *mut u32 = core::ptr::addr_of_mut!(PAYLOAD_EP);
+        *te = ep;
+        rust_ipc_channel_init();
         // 帧缓冲参数从 bootboot 抄 (fb_ptr@0x28, scanline/width/height)
         let bb = &*(0xffff_ffff_ffe0_0000usize as *const u8);
         let p = bb as *const u8;
@@ -739,17 +792,17 @@ pub extern "C" fn rust_tasks_init() -> i32 {
         let sb = core::ptr::addr_of_mut!(STACK_B) as u64 + 16384;
         let a = (*s).spawn(thread_alpha as u64, sa);
         let b = (*s).spawn(thread_beta as u64, sb);
+        let sc = core::ptr::addr_of_mut!(STACK_C) as u64 + 16384;
+        let d = (*s).spawn(thread_ipc as u64, sc);
         let ue = userland::user_payload_start as u64;
         let us = core::ptr::addr_of!(user_stack_top) as u64;
         let c = (*s).spawn_user(ue, us);
-        if a.is_none() || b.is_none() || c.is_none() {
+        if a.is_none() || b.is_none() || c.is_none() || d.is_none() {
             return -1;
         }
         // 直映射已上线, 页表修补在 Rust 里做
         patch_user_region(ue);
         patch_user_region(us);
-        pte_dump(us, b"STACK");
-        pte_dump(ue, b"CODE");
         0
     }
 }

@@ -14,6 +14,26 @@ fn token() -> u64 {
     unsafe { core::ptr::read_volatile(&raw const crate::PAYLOAD_TOKEN) as u64 }
 }
 
+fn token_ep() -> u64 {
+    unsafe { core::ptr::read_volatile(&raw const crate::PAYLOAD_EP) as u64 }
+}
+
+const SYS_IPC_SEND: u64 = 4;
+
+// 往 IPC 通道丢一条消息
+fn ipc_send(data: &[u8]) -> i64 {
+    let ret: i64;
+    unsafe {
+        asm!(
+            "int 0x80",
+            in("rax") SYS_IPC_SEND, in("rdi") token_ep(),
+            in("rsi") data.as_ptr(), in("rdx") data.len(),
+            lateout("rax") ret,
+        );
+    }
+    ret
+}
+
 #[inline(always)]
 fn putpixel(x: i64, y: i64, color: u32) -> i64 {
     let ret: i64;
@@ -68,6 +88,9 @@ pub extern "C" fn user_payload_start() -> ! {
             glyph(ch, 27 + (i as i64) * 12, 160, color);
         }
         phase += 1;
+        // 跟内核里的 IPC 服务线程打个招呼: 发相位数过去
+        let msg = (phase as u64).to_le_bytes();
+        let _ = ipc_send(&msg);
         let mut spin = 2_000_000i64;
         while spin > 0 {
             core::hint::spin_loop();
