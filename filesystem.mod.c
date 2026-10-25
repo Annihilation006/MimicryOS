@@ -1,6 +1,3 @@
-/* ---- filesystem 模块：内存文件系统 ----
- * 与磁盘上的 FAT12 并行。文件保存在内存链表 mem_file_t 中，断电即失。
- * 对应 shell 命令：touch(建)、write(写)、size、rm(删)、type(读)、ls(列)。 */
 #include "module.h"
 
 void fb_print(const char* str);

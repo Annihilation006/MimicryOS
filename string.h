@@ -2,7 +2,7 @@
 #define STRING_H
 
 int strcmp(const char* s1, const char* s2);
-int strlen(const char* s);
+unsigned long strlen(const char* s);
 char* strcpy(char* dest, const char* src);
 char* strcat(char* dest, const char* src);
 

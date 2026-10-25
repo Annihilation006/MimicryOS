@@ -1,6 +1,3 @@
-/* ---- desktop 模块：桌面环境 ----
- * 绘制桌面底色、任务栏和一个窗口边框。当前未在 kernel_main 中注册接线
- * （desktop 渲染尚未实现）。 */
 #include "module.h"
 
 typedef unsigned long long uint64_t;
@@ -37,8 +34,6 @@ void draw_window(int x, int y, int w, int h) {
     }
 }
 
-/* 警告：此函数用臆造的 initrd 偏移(124字节8进制)解析模块，可能越界读内存。
- * 当前未在 desktop_draw 中调用（已注释），暂不启用。 */
 void desktop_render_png(void) {
     unsigned char* ptr = (unsigned char*)bootboot.initrd_ptr;
     unsigned char* end = ptr + bootboot.initrd_size;

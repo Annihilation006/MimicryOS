@@ -1,6 +1,3 @@
-/* ---- mouse 模块：PS/2 鼠标驱动 ----
- * 读取鼠标数据更新坐标（仅原始数据）；mouse_draw 画一个叉形指针，
- * 但指针尚未接入桌面渲染，当前只做初始化。 */
 #include "module.h"
 
 void fb_print(const char* str);
@@ -10,6 +7,7 @@ void outb(unsigned short port, unsigned char val);
 
 static int mouse_x = 400;
 static int mouse_y = 300;
+static int mouse_button = 0;
 
 void mouse_init(void) {
     outb(0x64, 0xA8);
@@ -28,7 +26,7 @@ void mouse_update(void) {
     unsigned char byte2 = inb(0x60);
     if (!(inb(0x64) & 0x01)) return;
     unsigned char byte3 = inb(0x60);
-    (void)byte1;   /* 首字节含按键标志，当前未用，但必须消费以维持协议 */
+    mouse_button = byte1 & 0x07;
     mouse_x += (int)((char)byte2);
     mouse_y -= (int)((char)byte3);
     if (mouse_x < 0) mouse_x = 0;
