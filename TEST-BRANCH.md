@@ -23,14 +23,31 @@
 |---|---|
 | `cpu.asm` | x86_64 汇编地基：端口 I/O、CLI/STI/HLT、CR0/2/3/4 读写、CPUID、RDTSC、MSR 读写。全部 `asm_` 前缀，零符号冲突 |
 | `cpu.h` | 上述原语的 C 声明，供 C / Rust 两侧调用 |
-| `rust_kernel.rs` | Rust(no_std) 第一个编译单元：`rust_cpu_report()` 经 `extern "C"` 同时调用既有 C 的 `fb_print` 与 `cpu.asm` 原语，验证三方混合链接 |
+| `rust_kernel.rs` | Rust(no_std) 编译单元：`rust_cpu_report()` 验证三方互操作；`rust_mem_init()` 解析 BOOTBOOT 内存图初始化物理帧分配器 |
+| `frame.rs` | 物理帧位图分配器（02-memory.md 第一步）：next-fit、double-free 防护、越界截断；自带 7 项宿主单测（`rustc --test frame.rs`） |
 | `TEST-BRANCH.md` | 本文件 |
+
+**给 C 侧的直接接口**：`rust_mem_init()`（初始化，返回空闲帧数）、
+`rust_frame_alloc()`（成功返回帧号，失败 `u64::MAX`）、
+`rust_frame_free(frame_no)`（0=成功，-1=参数错误）、`rust_mem_report()`
+（经 fb_print 打印统计）。main 分支将来做分页时可直接调用，无需了解 Rust。
 
 构建说明：`make` 即可。装有 rustup（目标 `x86_64-unknown-none`）的机器会
 自动编入 Rust 对象；没有 rustc 的机器会打印提示并跳过，C 侧构建不受影响。
 
-后续计划：物理帧管理（Bitmap）、VMA、Rust 侧逐步扩大。每一步都保持
-"不动已有代码、只做加法"；`rust_cpu_report()` 何时接线调用，等 main 作者点头。
+**本地启动验证配方**（main 的 README 里缺了 boot 目录组装这步，在此补全）：
+
+```
+mkdir -p boot/sys
+cp kernel.elf boot/kernel.elf          # kernel 放 boot/ 根下
+printf 'kernel=kernel.elf\n' > boot/sys/config
+<path-to>/mkbootimg iso_build/myos.json iso_build/myos.img
+qemu-system-x86_64 -hda iso_build/myos.img -m 1024M
+```
+
+后续计划：VMA 管理、页表搭建（复用 `asm_read_cr3/asm_write_cr3`）。
+每一步都保持"不动已有代码、只做加法"；`rust_*()` 系列何时接线调用，
+等 main 作者点头。
 
 ## 署名约定
 
