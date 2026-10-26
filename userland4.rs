@@ -198,13 +198,14 @@ fn sys_brk(want: u64) -> u64 {
     ret
 }
 
-/// 让内核把 tmpfs 里的 ELF 文件装载成新 ring3 任务, 返回槽号
-fn sys_spawn(name: *const u8) -> u64 {
+/// 让内核把 tmpfs 里的 ELF 文件装载成新 ring3 任务, 参数压栈, 返回槽号
+fn sys_spawn(name: *const u8, arg: *const u8, arglen: u64) -> u64 {
     let ret: u64;
     unsafe {
         asm!(
             "int 0x80",
-            in("rax") SYS_SPAWN, in("rdi") token(), in("rsi") name,
+            in("rax") SYS_SPAWN, in("rdi") token(),
+            in("rsi") name, in("rdx") arg, in("r8") arglen,
             lateout("rax") ret,
         );
     }
@@ -212,6 +213,7 @@ fn sys_spawn(name: *const u8) -> u64 {
 }
 
 static mut NAME_BUF: [u8; 12] = [0; 12];
+static mut ARG_BUF: [u8; 8] = [0; 8];
 static mut SPAWNED: u8 = 0;
 
 #[no_mangle]
@@ -244,7 +246,7 @@ pub extern "C" fn cli_start() -> ! {
                 if ok {
                     glyph(b'O', DX + 99, DY + 2, color);
                     glyph(b'K', DX + 111, DY + 2, color);
-                    // 翻译器通了之后 spawn 一次 hello (SPAWN OK 写 fd2/行14)
+                    // 翻译器通了之后 spawn 一次 hello, 参数 "SPAWN OK" 压栈
                     if SPAWNED == 0 {
                         SPAWNED = 1;
                         let nb = core::ptr::addr_of_mut!(NAME_BUF) as *mut u8;
@@ -254,7 +256,14 @@ pub extern "C" fn cli_start() -> ! {
                             *nb.add(k) = nm[k];
                             k += 1;
                         }
-                        let slot = sys_spawn(nb);
+                        let ab = core::ptr::addr_of_mut!(ARG_BUF) as *mut u8;
+                        let am = b"SPAWN OK";
+                        let mut k = 0usize;
+                        while k < am.len() {
+                            *ab.add(k) = am[k];
+                            k += 1;
+                        }
+                        let slot = sys_spawn(nb, ab, am.len() as u64);
                         // 行15: 'S' + 三位 (成功=槽号青色, 失败=故障码红色)
                         fill(SX, SY, 70, 20, BLACK);
                         glyph(b'S', SX + 1, SY + 2, CYAN);

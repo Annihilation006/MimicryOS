@@ -100,6 +100,75 @@ where
     unsafe { elf.load_into(map_fn) }
 }
 
+// ---- 参数版: 程序从栈页底部固定地址取 argv, write(fd=rdi 处) 后退出 ----
+// 内核约定: 栈页底部 base+0x1000 = 参数长度, base+0x1008 = 参数指针。
+// 程序用 RIP 相对读 (disp32 无射程限制), 代码在 base+CODE_OFF:
+//   lea 处止于 CODE_OFF+7 → dispA = 0x1000 - CODE_OFF - 7
+//   第二条止于 CODE_OFF+14 → dispB = 0x1000 - CODE_OFF - 14
+pub const ARG_CODE_LEN: usize = 41;
+const DISP_A: i32 = (0x1000 - CODE_OFF - 7) as i32;
+const DISP_B: i32 = (0x1000 - CODE_OFF - 14) as i32;
+
+/// 机器码:
+///   mov rax, [rip+DISP_A] ; len
+///   mov rdx, [rip+DISP_B] ; ptr
+///   mov rsi, rdx
+///   mov rdx, rax
+///   mov eax, 1 / mov edi, fd / int 0x80 / mov eax, 60 / int 0x80 / jmp $
+const ARG_CODE: [u8; ARG_CODE_LEN] = [
+    0x48, 0x8B, 0x05,
+    (DISP_A & 0xFF) as u8,
+    ((DISP_A >> 8) & 0xFF) as u8,
+    ((DISP_A >> 16) & 0xFF) as u8,
+    ((DISP_A >> 24) & 0xFF) as u8, // mov rax, [rip+DISP_A]
+    0x48, 0x8B, 0x15,
+    (DISP_B & 0xFF) as u8,
+    ((DISP_B >> 8) & 0xFF) as u8,
+    ((DISP_B >> 16) & 0xFF) as u8,
+    ((DISP_B >> 24) & 0xFF) as u8, // mov rdx, [rip+DISP_B]
+    0x48, 0x89, 0xD6, // mov rsi, rdx
+    0x48, 0x89, 0xC2, // mov rdx, rax
+    0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+    0xBF, 0x02, 0x00, 0x00, 0x00, // mov edi, 2
+    0xCD, 0x80, // int 0x80
+    0xB8, 0x3C, 0x00, 0x00, 0x00, // mov eax, 60
+    0xCD, 0x80, // int 0x80
+    0xEB, 0xFE, // jmp $
+];
+
+/// 参数版镜像: 入口即 write(2, argv, len) 后退出。IMG_LEN 同为 161。
+pub fn build_image_arg(out: &mut [u8], base: u64) -> usize {
+    let mut buf = [0u8; IMG_LEN];
+    buf[0..4].copy_from_slice(&ELF_MAGIC);
+    buf[4] = ELF_CLASS_64;
+    buf[5] = ELF_DATA_2LSB;
+    buf[6] = 1;
+    buf[16..18].copy_from_slice(&2u16.to_le_bytes());
+    buf[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
+    buf[20..24].copy_from_slice(&1u32.to_le_bytes());
+    buf[24..32].copy_from_slice(&(base + CODE_OFF as u64).to_le_bytes());
+    buf[32..40].copy_from_slice(&(EH as u64).to_le_bytes());
+    buf[52..54].copy_from_slice(&(EH as u16).to_le_bytes());
+    buf[54..56].copy_from_slice(&(PH as u16).to_le_bytes());
+    buf[56..58].copy_from_slice(&1u16.to_le_bytes());
+
+    let p = EH;
+    buf[p..p + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+    buf[p + 4..p + 8].copy_from_slice(&(PF_R | PF_X).to_le_bytes());
+    buf[p + 8..p + 16].copy_from_slice(&0u64.to_le_bytes());
+    buf[p + 16..p + 24].copy_from_slice(&base.to_le_bytes());
+    buf[p + 24..p + 32].copy_from_slice(&base.to_le_bytes());
+    buf[p + 32..p + 40].copy_from_slice(&(IMG_LEN as u64).to_le_bytes());
+    buf[p + 40..p + 48].copy_from_slice(&(IMG_LEN as u64).to_le_bytes());
+    buf[p + 48..p + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+    buf[CODE_OFF..CODE_OFF + ARG_CODE_LEN].copy_from_slice(&ARG_CODE);
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), out.as_mut_ptr(), IMG_LEN);
+    }
+    IMG_LEN
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +212,24 @@ mod tests {
         let disp = i32::from_le_bytes([code[13], code[14], code[15], code[16]]);
         assert_eq!(disp as usize, CODE_LEN - 17);
         // 位置无关: 换基址装载, 入口随差值平移
+        let entry = load(&buf[..n], |_, _, _| Ok(())).unwrap();
+        assert_eq!(entry, 0x0040_0000 + CODE_OFF as u64);
+    }
+
+    #[test]
+    fn arg_variant_reads_stack() {
+        let mut buf = [0u8; 256];
+        let n = build_image_arg(&mut buf, 0x0040_0000);
+        assert_eq!(n, IMG_LEN);
+        let code = &buf[CODE_OFF..CODE_OFF + ARG_CODE_LEN];
+        // RIP 相对取参: 两条 lea/mov 的 disp 指向栈页底部
+        assert_eq!(&code[0..3], &[0x48, 0x8B, 0x05]);
+        assert_eq!(&code[7..10], &[0x48, 0x8B, 0x15]);
+        let da = i32::from_le_bytes([code[3], code[4], code[5], code[6]]);
+        let db = i32::from_le_bytes([code[10], code[11], code[12], code[13]]);
+        // 指令止于 CODE_OFF+7 / +14, 目标 = base+0x1000 / +0x1008
+        assert_eq!(da as usize, 0x1000 - CODE_OFF - 7);
+        assert_eq!(db as usize, 0x1000 - CODE_OFF - 14);
         let entry = load(&buf[..n], |_, _, _| Ok(())).unwrap();
         assert_eq!(entry, 0x0040_0000 + CODE_OFF as u64);
     }

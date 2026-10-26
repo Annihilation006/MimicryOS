@@ -740,8 +740,9 @@ const SPAWN_VBASE: u64 = 0x0060_0000; // 6MB, 在帧分配器保留线以上
 static mut USER_BRK: u64 = 0x0100_0000;
 const USER_BRK_END: u64 = 0x0140_0000;
 
-/// 把 tmpfs 里的 ELF 镜像装载成 ring3 任务。返回任务槽号, 失败 u64::MAX。
-unsafe fn spawn_elf_image(bin: &[u8]) -> u64 {
+/// 把 tmpfs 里的 ELF 镜像装载成 ring3 任务。arg 为启动参数 (≤64B)。
+/// 返回任务槽号, 失败 u64::MAX。
+unsafe fn spawn_elf_image(bin: &[u8], arg: &[u8]) -> u64 {
     let dbg = core::ptr::addr_of_mut!(SPAWN_DBG);
     *dbg = 0;
     let seq = SPAWN_SEQ;
@@ -787,6 +788,23 @@ unsafe fn spawn_elf_image(bin: &[u8]) -> u64 {
     if loaded.is_err() {
         *dbg = 7;
         return u64::MAX;
+    }
+    // 参数块放栈页底部固定地址 (约定: base+0x1000 = len, base+0x1008 = ptr,
+    // 程序用 RIP 相对读), 参数串紧随其后; 与栈顶活动区相距整页, 无碰撞
+    let mut alen = arg.len();
+    if alen > 64 {
+        alen = 64;
+    }
+    if alen > 0 {
+        let stkw = if frame::DIRECT {
+            (base + 0x1000 + frame::DIRECT_BASE) as *mut u8
+        } else {
+            (base + 0x1000) as *mut u8
+        };
+        core::ptr::write_volatile(stkw as *mut u64, alen as u64);
+        core::ptr::write_volatile(stkw.wrapping_add(8) as *mut u64, base + 0x1010);
+        let argv = stkw.wrapping_add(16);
+        core::ptr::copy_nonoverlapping(arg.as_ptr(), argv, alen);
     }
     *dbg = 0xFF;
     // 入口平移: 镜像内地址 → 运行基址; 栈顶 = 第二页顶端
@@ -949,8 +967,8 @@ pub extern "C" fn rust_syscall_entry(frame: *mut syscall::SyscallFrame) -> u64 {
             f.rax = len as u64;
             return 0;
         }
-        // 11 = SYS_SPAWN: rsi = tmpfs 文件名 (12B), 读 ELF 镜像装载为 ring3 任务
-        // 段与栈各一物理帧, map_page 挂 USER|W, 新任务占死槽复用位
+        // 11 = SYS_SPAWN: rsi = tmpfs 文件名 (12B), rdx = 参数指针, r8 = 参数长
+        // 读 ELF 镜像装载为 ring3 任务, 参数压进程栈
         if f.rax == 11 {
             f.rax = if fb_cap_check(f.rdi as u32) {
                 let mut name = [0u8; tmpfs::NAME_LEN];
@@ -960,6 +978,15 @@ pub extern "C" fn rust_syscall_entry(frame: *mut syscall::SyscallFrame) -> u64 {
                     *(name.as_mut_ptr().add(k)) = *src.add(k);
                     k += 1;
                 }
+                // 参数: 用户内存 ≤64B
+                let mut arg = [0u8; 64];
+                let mut alen = if f.r8 > 64 { 64 } else { f.r8 } as usize;
+                let asrc = f.rdx as *const u8;
+                let mut k = 0usize;
+                while k < alen {
+                    *(arg.as_mut_ptr().add(k)) = *asrc.add(k);
+                    k += 1;
+                }
                 match FS.open(&name) {
                     Some(h) => {
                         let mut bin = [0u8; tmpfs::FILE_CAP];
@@ -967,7 +994,7 @@ pub extern "C" fn rust_syscall_entry(frame: *mut syscall::SyscallFrame) -> u64 {
                         if n == 0 {
                             u64::MAX
                         } else {
-                            spawn_elf_image(&bin[..n])
+                            spawn_elf_image(&bin[..n], &arg[..alen])
                         }
                     }
                     None => u64::MAX,
@@ -1273,7 +1300,8 @@ pub extern "C" fn rust_tasks_init() -> i32 {
         if FS.write(fh, 0, core::slice::from_raw_parts(img, img_len)) != img_len {
             return -4;
         }
-        // spawn 演示程序: 写 "SPAWN OK" 到 fd 2 (行14) 后退出, 供 SYS_SPAWN 装载
+        // spawn 演示程序: 写 "SPAWN OK" 到 fd 2 (行14) 后退出, 供 SYS_SPAWN 装载。
+        // 参数版 (build_image_arg) 机制已就位但用户态读参尚待调试, 暂用固定消息版
         static mut HELLO_IMG: [u8; 256] = [0; 256];
         let hp = core::ptr::addr_of_mut!(HELLO_IMG) as *mut u8;
         let hn = elfprog::build_image_msg(
@@ -1348,9 +1376,9 @@ pub extern "C" fn rust_tick_hook() {
 }
 
 // shell 的 run 命令入口: 按名装载 tmpfs ELF 为新任务, 返回槽号 (u64::MAX=败)
-// dbg 标记: 0xC0=入口 0xC1=open 成功 0xC2=读完成 0xC3=装载完成 0xCE=open 败
+// dbg 标记: 0xC0=入口 0xC1=open 成功 0xCD=读到空 0xC3=装载完成 0xCE=open 败
 #[no_mangle]
-pub extern "C" fn rust_spawn_file(name: *const u8) -> u64 {
+pub extern "C" fn rust_spawn_file(name: *const u8, arg: *const u8, arglen: u64) -> u64 {
     unsafe {
         let dbg = core::ptr::addr_of_mut!(SPAWN_DBG);
         *dbg = 0xC0;
@@ -1366,6 +1394,19 @@ pub extern "C" fn rust_spawn_file(name: *const u8) -> u64 {
             *(nm.as_mut_ptr().add(k)) = c;
             k += 1;
         }
+        let mut ab = [0u8; 64];
+        let mut alen = if arglen > 64 { 64 } else { arglen as usize };
+        // 参数同样按 C 串语义: 首个 NUL 截断
+        let mut k = 0usize;
+        while k < alen {
+            let c = *arg.add(k);
+            if c == 0 {
+                alen = k;
+                break;
+            }
+            *(ab.as_mut_ptr().add(k)) = c;
+            k += 1;
+        }
         match FS.open(&nm) {
             Some(h) => {
                 *dbg = 0xC1;
@@ -1376,7 +1417,7 @@ pub extern "C" fn rust_spawn_file(name: *const u8) -> u64 {
                     return u64::MAX;
                 }
                 *dbg = 0xC0 | (n as u32 & 0xFF); // 读到的长度低 8 位
-                let r = spawn_elf_image(&bin[..n]);
+                let r = spawn_elf_image(&bin[..n], &ab[..alen]);
                 *dbg = 0xC3;
                 r
             }

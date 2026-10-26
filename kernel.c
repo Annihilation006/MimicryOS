@@ -24,7 +24,7 @@ extern void rust_kb_feed(unsigned char c);
 /* [test] 直映射: 在现行页表空闲槽铺 1GB 大页窗口, 不切 CR3 */
 extern int rust_direct_map_init(unsigned long long max_phys);
 /* [test] run 命令: tmpfs ELF → 新任务 */
-extern unsigned long long rust_spawn_file(unsigned char *name);
+extern unsigned long long rust_spawn_file(unsigned char *name, unsigned char *arg, unsigned long long arglen); /* [test] run 命令 */
 #include "idt.h"
 #include "pic.h"
 #include "console.h"
@@ -789,8 +789,15 @@ void shell(void) {
                 outw(0x530E, 0x0000);
                 outw(0x5307, 0x0001);
             } else if (cmd[0] == 'r' && cmd[1] == 'u' && cmd[2] == 'n' && cmd[3] == ' ' && cmd[4]) {
-                /* [test] run <name>: 把 tmpfs 里的 ELF 文件装载为新任务 */
-                unsigned long long slot = rust_spawn_file(&cmd[4]);
+                /* [test] run <file> [arg]: 把 tmpfs 里的 ELF 文件装载为新任务,
+                 * 第二个词作为参数压到新进程的栈上 */
+                unsigned char *argp = (unsigned char*)"";
+                {
+                    int fi = 4;
+                    while (cmd[fi] && cmd[fi] != ' ') fi++;
+                    if (cmd[fi] == ' ') { cmd[fi] = '\0'; argp = (unsigned char*)&cmd[fi + 1]; }
+                }
+                unsigned long long slot = rust_spawn_file(&cmd[4], argp, 64);
                 if (slot == 0xFFFFFFFFFFFFFFFFULL) {
                     fb_print("[run] failed\n");
                 } else {
