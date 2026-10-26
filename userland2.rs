@@ -16,6 +16,7 @@ fn token() -> u64 {
 const SYS_GLYPH: u64 = 2;
 const SYS_FILL: u64 = 13;
 const SYS_YIELD: u64 = 12;
+const SYS_SLEEP: u64 = 14;
 
 fn yield_now() {
     unsafe {
@@ -48,6 +49,18 @@ fn fill(x: i64, y: i64, w: i64, h: i64, color: u32) {
             in("rax") SYS_FILL, in("rdi") token(),
             in("rsi") x, in("rdx") y, in("r8") w, in("r9") h,
             in("r10") color as u64,
+            lateout("rax") _,
+        );
+    }
+}
+
+/// 定时睡眠: 延迟 ticks (100Hz), 期间内核不调度本任务
+fn sleep(ticks: u64) {
+    unsafe {
+        asm!(
+            "int 0x80",
+            in("rax") SYS_SLEEP, in("rdi") token(),
+            in("rsi") ticks,
             lateout("rax") _,
         );
     }
@@ -96,11 +109,7 @@ pub extern "C" fn user2_start() -> ! {
             }
         }
         n = n.wrapping_add(1);
-        let mut spin = 1_000_000i64;
-        while spin > 0 {
-            core::hint::spin_loop();
-            spin -= 1;
-        }
+        sleep(50); // 半秒一拍, 不再空转烧 CPU
         yield_now();
     }
 }

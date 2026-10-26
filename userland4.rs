@@ -10,6 +10,7 @@ const SYS_IPC_SEND: u64 = 4;
 const SYS_IPC_RECV: u64 = 5;
 const SYS_FILL: u64 = 13;
 const SYS_YIELD: u64 = 12;
+const SYS_SLEEP: u64 = 14;
 
 // 令牌静态走 crate 路径 (extern "C" 引不到 Rust 命名修饰符号)
 fn token() -> u64 {
@@ -74,6 +75,18 @@ fn ipc_recv(tok: u64, buf: *mut u8, len_out: *mut u64, cap_out: *mut u32) -> u64
 fn yield_now() {
     unsafe {
         asm!("int 0x80", in("rax") SYS_YIELD, in("rdi") token(), lateout("rax") _,);
+    }
+}
+
+/// 定时睡眠: 延迟 ticks (100Hz)
+fn sleep(ticks: u64) {
+    unsafe {
+        asm!(
+            "int 0x80",
+            in("rax") SYS_SLEEP, in("rdi") token(),
+            in("rsi") ticks,
+            lateout("rax") _,
+        );
     }
 }
 
@@ -251,11 +264,7 @@ pub extern "C" fn cli_start() -> ! {
                 glyph(b'S', DX + 27, DY + 2, RED);
             }
         }
-        let mut spin = 2_000_000i64;
-        while spin > 0 {
-            core::hint::spin_loop();
-            spin -= 1;
-        }
+        sleep(100); // 一秒一拍 VFS 往返, 不再空转
         yield_now();
     }
 }

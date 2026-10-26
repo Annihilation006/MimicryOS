@@ -23,6 +23,19 @@ const SYS_OPEN: u64 = 6;
 const SYS_WRF: u64 = 7;
 const SYS_VMO_CREATE: u64 = 9;
 const SYS_YIELD: u64 = 12;
+const SYS_SLEEP: u64 = 14;
+
+/// 定时睡眠: 延迟 ticks (100Hz)
+fn sleep(ticks: u64) {
+    unsafe {
+        asm!(
+            "int 0x80",
+            in("rax") SYS_SLEEP, in("rdi") token(),
+            in("rsi") ticks,
+            lateout("rax") _,
+        );
+    }
+}
 
 // 建一块共享内存, 返回基址 (第二个用户任务从那儿读)
 fn vmo_create() -> u64 {
@@ -159,11 +172,6 @@ pub extern "C" fn user_payload_start() -> ! {
         // 跟内核里的 IPC 服务线程打个招呼: 发相位数过去
         let msg = (phase as u64).to_le_bytes();
         let _ = ipc_send(&msg);
-        yield_now();
-        let mut spin = 2_000_000i64;
-        while spin > 0 {
-            core::hint::spin_loop();
-            spin -= 1;
-        }
+        sleep(100); // 一秒一拍, 不再空转烧 CPU
     }
 }

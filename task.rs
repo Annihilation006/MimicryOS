@@ -16,10 +16,21 @@ pub struct Task {
     pub irq_top: u64, // 该任务的内核中断栈顶 (TSS.RSP0), 0 = 未分配
 }
 
+// 定时睡眠表项: 到点被 tick 钩子唤醒
+#[derive(Clone, Copy)]
+pub struct Sleeper {
+    pub task: usize,
+    pub deadline: u64,
+    pub used: bool,
+}
+
+pub const NSLEEP: usize = 8;
+
 pub struct Scheduler {
     pub t: [Task; 12],
     pub n: usize,   // 已占槽上限（死槽可复用）
     pub cur: usize, // 当前运行槽
+    pub sleepers: [Sleeper; NSLEEP],
 }
 
 impl Scheduler {
@@ -28,6 +39,7 @@ impl Scheduler {
             t: [Task { rsp: 0, live: false, dead: false, irq_top: 0 }; 12],
             n: 0,
             cur: 0,
+            sleepers: [Sleeper { task: 0, deadline: 0, used: false }; NSLEEP],
         }
     }
 
@@ -115,14 +127,47 @@ impl Scheduler {
         (*t.add(self.cur)).dead = true;
     }
 
-    pub unsafe fn wake(&mut self, idx: usize) {
+    pub unsafe fn wake(&mut self, idx: usize) -> bool {
         if idx < self.n {
             let t = core::ptr::addr_of_mut!(self.t) as *mut Task;
             let task = &mut *t.add(idx);
             if !task.dead {
                 task.live = true;
+                return true;
             }
         }
+        false
+    }
+
+    // 登记定时睡眠: 满/重复登记返回 false
+    pub fn sleep_push(&mut self, task: usize, deadline: u64) -> bool {
+        for i in 0..NSLEEP {
+            if self.sleepers[i].used && self.sleepers[i].task == task {
+                return false;
+            }
+        }
+        for i in 0..NSLEEP {
+            if !self.sleepers[i].used {
+                self.sleepers[i] = Sleeper { task, deadline, used: true };
+                return true;
+            }
+        }
+        false
+    }
+
+    // tick 钩子: 唤醒所有到点任务, 返回真唤醒数 (退出任务不救)
+    pub fn sleep_wake(&mut self, now: u64) -> usize {
+        let mut woke = 0usize;
+        for i in 0..NSLEEP {
+            if self.sleepers[i].used && now >= self.sleepers[i].deadline {
+                let t = self.sleepers[i].task;
+                self.sleepers[i] = Sleeper { task: 0, deadline: 0, used: false };
+                if unsafe { self.wake(t) } {
+                    woke += 1;
+                }
+            }
+        }
+        woke
     }
 
     unsafe fn spawn_with(
@@ -277,5 +322,36 @@ mod tests {
             // 轮转应调度到复用槽
             assert_eq!(s.schedule(0x61_0000), t0 - 176);
         }
+    }
+
+    #[test]
+    fn t8_sleep_wake_on_deadline() {
+        let mut stacks = Vec::new();
+        let mut s = Scheduler::new();
+        unsafe {
+            for _ in 0..8 {
+                let (v, top) = mkstack();
+                stacks.push(v);
+                s.spawn(0x1000, top);
+            }
+        }
+        // 登记睡眠 100 ticks, 未到点不唤醒
+        assert!(s.sleep_push(0, 100));
+        assert_eq!(s.sleep_wake(50), 0);
+        assert_eq!(s.sleep_wake(99), 0);
+        // 到点唤醒, 表项回收
+        assert_eq!(s.sleep_wake(100), 1);
+        assert_eq!(s.sleep_wake(200), 0);
+        // 重复登记拒绝
+        assert!(s.sleep_push(0, 300));
+        assert!(!s.sleep_push(0, 400));
+        // 表满拒绝
+        for t in 1..NSLEEP {
+            assert!(s.sleep_push(t, 1000));
+        }
+        assert!(!s.sleep_push(9, 1000));
+        // 退出任务的睡眠项到点也不该把它救活 (wake 忽略 dead)
+        unsafe { s.exit_cur() };
+        assert_eq!(s.sleep_wake(1000), NSLEEP - 1);
     }
 }

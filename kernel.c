@@ -856,8 +856,10 @@ static volatile unsigned int pit_ticks = 0;
 extern unsigned long long rust_schedule(unsigned long long frame);
 extern unsigned int rust_thread_counts(unsigned int which);
 extern void rust_tasks_init(void);
+extern void rust_tick_hook(void); /* [test] 每 tick: 定时睡眠到点唤醒 */
 static unsigned long long pit_tick(interrupt_frame_t* f) {
     pit_ticks++;
+    rust_tick_hook();
     unsigned int t = pit_ticks;
     int cols = (int)(bootboot.fb_width / 9);
     if ((t & 31) == 0) {

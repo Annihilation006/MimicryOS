@@ -646,6 +646,13 @@ extern "C" {
     static user_stack_top: u8; // usermode.asm 的符号
 }
 
+// Rust 侧自己的 tick 计数 (rust_tick_hook 每 tick +1), 睡眠时限的基准
+static mut RUST_TICKS: u64 = 0;
+
+fn tick_now() -> u64 {
+    unsafe { core::ptr::read_volatile(&raw const RUST_TICKS) }
+}
+
 // 端点能力检查: IPC 系统调用的门票
 fn ep_cap_check(token: u32) -> bool {
     unsafe {
@@ -1002,6 +1009,19 @@ pub extern "C" fn rust_syscall_entry(frame: *mut syscall::SyscallFrame) -> u64 {
             f.rax = 0;
             return rust_schedule(frame as u64);
         }
+        // 14 = SLEEP: rsi = 延迟 (tick, 100Hz), 到点由 tick 钩子唤醒
+        if f.rax == 14 {
+            let s: *mut task::Scheduler = core::ptr::addr_of_mut!(SCHED);
+            let delay = if f.rsi > 6000 { 6000 } else { f.rsi };
+            let now = tick_now() as u64;
+            if (*s).sleep_push((*s).cur_index(), now + delay) {
+                (*s).block_cur();
+                f.rax = 0;
+                return rust_schedule(frame as u64);
+            }
+            f.rax = u64::MAX; // 睡眠表满
+            return 0;
+        }
         // 6/7/8 = 文件打开/写/读: 文件令牌 = grant(CAP_VMO, 文件号)
         if f.rax == 6 {
             // OPEN: rdi=调用方任一有效令牌, rsi=名字指针 → rax=新文件令牌
@@ -1284,6 +1304,19 @@ pub extern "C" fn rust_tasks_init() -> i32 {
         patch_user_region(seg_base);
         patch_user_region(elf_stack_top - 4096);
         0
+    }
+}
+
+// pit_tick 取线程计数做单点渲染
+#[no_mangle]
+// pit_tick 每 tick 调 (kernel.c 首行), 计数 + 到点睡眠唤醒
+#[no_mangle]
+pub extern "C" fn rust_tick_hook() {
+    unsafe {
+        let t = core::ptr::addr_of_mut!(RUST_TICKS);
+        *t += 1;
+        let s: *mut task::Scheduler = core::ptr::addr_of_mut!(SCHED);
+        (*s).sleep_wake(*t);
     }
 }
 
