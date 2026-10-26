@@ -8,6 +8,7 @@ pub const SYS_READ: u64 = 0;
 pub const SYS_WRITE: u64 = 1;
 pub const SYS_PUTPIXEL: u64 = 1;
 pub const SYS_GLYPH: u64 = 2;
+pub const SYS_FILL: u64 = 13;
 pub const SYS_EXIT: u64 = 60;
 
 pub const CAP_FRAMEBUF: u32 = capability::CAP_VMO; // 帧缓冲就是一种 VMO
@@ -46,6 +47,19 @@ pub const MICROFONT: &[(u8, [u8; 5])] = &[
 pub trait FbSink {
     fn put(&mut self, x: i64, y: i64, color: u32);
     fn size(&self) -> (i64, i64);
+
+    /// 矩形填充, 缺省用 put 循环; 先擦后画的擦就是它
+    fn fill(&mut self, x: i64, y: i64, w: i64, h: i64, color: u32) {
+        let mut dy = 0i64;
+        while dy < h {
+            let mut dx = 0i64;
+            while dx < w {
+                self.put(x + dx, y + dy, color);
+                dx += 1;
+            }
+            dy += 1;
+        }
+    }
 }
 
 pub struct Framebuffer {
@@ -126,6 +140,18 @@ pub fn dispatch(
             // 退出当前任务
             0
         }
+        SYS_FILL => {
+            // 矩形填充: rdi=令牌 rsi=x rdx=y r8=w r9=h r10=色
+            // 数字滚动会留残影, 先擦后画; w/h 钳死防野调用长期占着关中断窗口
+            if !cap_check(f.rdi as u32) {
+                u64::MAX
+            } else {
+                let w = if f.r8 > 512 { 512 } else { f.r8 } as i64;
+                let h = if f.r9 > 512 { 512 } else { f.r9 } as i64;
+                sink.fill(f.rsi as i64, f.rdx as i64, w, h, f.r10 as u32);
+                0
+            }
+        }
         _ => u64::MAX,
     };
     f.rax = ret;
@@ -199,5 +225,39 @@ mod tests {
         let mut s = MemSink { px: Vec::new() };
         dispatch(&mut f, |t| t == 1, &mut s);
         assert_eq!(f.rax, u64::MAX);
+    }
+
+    #[test]
+    fn t6_fill_paints_rect_with_cap() {
+        let mut f = frame(SYS_FILL, 1, 5, 6, 2);
+        f.r9 = 2;
+        f.r10 = 0x00FF00;
+        let mut s = MemSink { px: Vec::new() };
+        dispatch(&mut f, |t| t == 1, &mut s);
+        assert_eq!(f.rax, 0);
+        assert_eq!(s.px.len(), 4); // 2x2 全画
+        assert!(s.px.iter().all(|p| p.2 == 0x00FF00));
+    }
+
+    #[test]
+    fn t7_fill_without_cap_rejected() {
+        let mut f = frame(SYS_FILL, 99, 0, 0, 10);
+        f.r9 = 10;
+        f.r10 = 1;
+        let mut s = MemSink { px: Vec::new() };
+        dispatch(&mut f, |t| t == 1, &mut s);
+        assert_eq!(f.rax, u64::MAX);
+        assert!(s.px.is_empty());
+    }
+
+    #[test]
+    fn t8_fill_clamps_size() {
+        let mut f = frame(SYS_FILL, 1, 0, 0, u64::MAX);
+        f.r9 = u64::MAX;
+        f.r10 = 1;
+        let mut s = MemSink { px: Vec::new() };
+        dispatch(&mut f, |t| t == 1, &mut s);
+        assert_eq!(f.rax, 0);
+        assert_eq!(s.px.len(), 512 * 512);
     }
 }
