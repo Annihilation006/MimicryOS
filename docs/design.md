@@ -52,15 +52,17 @@ recv 系统调用按端点令牌路由；空通道登记每通道等待者后阻
 **系统调用号**：0 read(键盘队列, 空则阻塞) · 1 画点/write(fd1→行11,
 fd2→行14) · 2 字形 · 4 IPC_SEND · 5 IPC_RECV · 6 OPEN · 7 WRF · 8 RDF
 · 9 VMO_CREATE · 10 VMO_GETADDR · 11 SPAWN(tmpfs ELF→新任务) · 12 YIELD
-· 13 FILL(先擦后画) · 14 SLEEP(tick 定时, 睡眠表 8 项) · 60 EXIT(死槽回收)。
+· 13 FILL(先擦后画) · 14 SLEEP(tick 定时, 睡眠表 8 项) · 15 BRK(用户态
+bump 堆, 16MB 起 4MB) · 60 EXIT(死槽回收)。
 
 **定时**：kernel.c pit_tick 首行调 rust_tick_hook（每 tick）——Rust 自持
 RUST_TICKS 并唤醒到点睡眠任务。
 
 **直映射**：rust_direct_map_init 在现行页表空闲 PML4 槽（272）铺 1GB
 大页窗口（0xFFFF_8800_0000_0000 起），不切 CR3；DIRECT 标志置位后
-frame_to_virt 与 spawn 的段拷贝走该窗口。rust_vm_bootstrap（切 CR3 版）
-封存备用。
+frame_to_virt 与 spawn/BRK 的段拷贝走该窗口。rust_vm_bootstrap（切 CR3
+版）封存备用。帧分配器 40MB 以下不发帧——6-40MB 是恒等窗口专属区
+（SPAWN 装载 / BRK 堆 / 直映射表帧），避免分配帧与窗口内容撞车。
 
 **FrameSource** 是 Rust 侧的供给接口：`alloc_frame/free_frame/frame_to_virt`。
 内核实现依赖 BOOTBOOT 的低地址身份映射（phys == virt）；一旦内核建立
