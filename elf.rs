@@ -117,13 +117,16 @@ impl<'a> ElfFile<'a> {
 
             if ph.seg_type == PT_LOAD {
                 if seg_count < MAX_SEGMENTS {
-                    segments[seg_count] = Some(LoadSegment {
-                        offset: ph.offset,
-                        vaddr: ph.vaddr,
-                        filesz: ph.filesz,
-                        memsz: ph.memsz,
-                        flags: ph.flags,
-                    });
+                    // 裸指针写槽位: 裸机链接没有 panic_bounds_check
+                    unsafe {
+                        *(segments.as_mut_ptr().add(seg_count)) = Some(LoadSegment {
+                            offset: ph.offset,
+                            vaddr: ph.vaddr,
+                            filesz: ph.filesz,
+                            memsz: ph.memsz,
+                            flags: ph.flags,
+                        });
+                    }
                     seg_count += 1;
                 }
             }
@@ -146,16 +149,14 @@ impl<'a> ElfFile<'a> {
     where
         F: FnMut(u64, &[u8], u32) -> Result<(), ElfError>,
     {
-        for i in 0..self.seg_count {
-            if let Some(seg) = self.segments[i] {
-                let off = seg.offset as usize;
-                let fsz = seg.filesz as usize;
-                if off + fsz > self.data.len() {
-                    return Err(ElfError::TruncatedProgramHeader);
-                }
-                let bytes = &self.data[off..off + fsz];
-                map_fn(seg.vaddr, bytes, seg.flags)?;
+        for seg in self.segments.iter().take(self.seg_count).flatten() {
+            let off = seg.offset as usize;
+            let fsz = seg.filesz as usize;
+            if off + fsz > self.data.len() {
+                return Err(ElfError::TruncatedProgramHeader);
             }
+            let bytes = unsafe { core::slice::from_raw_parts(self.data.as_ptr().add(off), fsz) };
+            map_fn(seg.vaddr, bytes, seg.flags)?;
         }
         Ok(self.entry)
     }

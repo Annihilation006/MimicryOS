@@ -52,6 +52,8 @@ mod tmpfs;
 mod elf;
 #[path = "translator.rs"]
 mod translator;
+#[path = "elfprog.rs"]
+mod elfprog;
 
 use core::panic::PanicInfo;
 
@@ -699,6 +701,26 @@ pub extern "C" fn rust_syscall_entry(frame: *mut syscall::SyscallFrame) -> u64 {
     unsafe {
         let f = &mut *frame;
         // 4 = IPC_SEND: rdi=端点令牌 rsi=用户缓冲 rdx=长度, 过能力门才进通道
+        // 60 = SYS_EXIT: 当前任务不再可调度, 切走
+        if f.rax == 60 {
+            let s: *mut task::Scheduler = core::ptr::addr_of_mut!(SCHED);
+            (*s).block_cur();
+            f.rax = 0;
+            return rust_schedule(frame as u64);
+        }
+        // 1 = SYS_WRITE 的 Linux 兼容形态 (fd 1): 文本画到第 11 行 (不走能力门)
+        if f.rax == 1 && f.rdi == 1 {
+            let len = if f.rdx > 64 { 64 } else { f.rdx } as usize;
+            let src = f.rsi as *const u8;
+            let mut k = 0usize;
+            while k < len {
+                let ch = *src.add(k);
+                fb_putchar(k as i32, 11, ch, 0x00FF00);
+                k += 1;
+            }
+            f.rax = len as u64;
+            return 0;
+        }
         if f.rax == 4 {
             f.rax = if ep_cap_check(f.rdi as u32) {
                 let len = if f.rdx > 48 { 48 } else { f.rdx };
@@ -934,6 +956,27 @@ pub extern "C" fn rust_tasks_init() -> i32 {
         let c = (*s).spawn_user(ue, us);
         let u2 = userland2::user2_start as u64;
         let c2 = (*s).spawn_user(u2, userland2::stack_top());
+        // ELF 任务: 镜像装到静态缓冲, 段拷进 LOAD_BASE 处的专属页, 入口取 e_entry
+        static mut ELF_IMG: [u8; 512] = [0; 512];
+        static mut ELF_SEG: [u8; 0x1000] = [0; 0x1000];
+        static mut ELF_STACK: [u8; 4096] = [0; 4096];
+        let img = core::ptr::addr_of_mut!(ELF_IMG) as *mut u8;
+        let seg_base = core::ptr::addr_of_mut!(ELF_SEG) as u64;
+        // 段虚拟基址 = 段实际地址, 装载即按恒等地址拷贝, 无需额外建页
+        let img_len = elfprog::build_image(core::slice::from_raw_parts_mut(img, 512), seg_base);
+        let elf_entry = elfprog::load(core::slice::from_raw_parts(img, img_len), |va, bytes, _| {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), va as *mut u8, bytes.len());
+            Ok(())
+        });
+        let elf_entry = match elf_entry {
+            Ok(e) => e,
+            Err(_) => return -2,
+        };
+        let elf_stack_top = core::ptr::addr_of_mut!(ELF_STACK) as u64 + 4096;
+        let c3 = (*s).spawn_user(elf_entry, elf_stack_top);
+        if c3.is_none() {
+            return -3;
+        }
         if a.is_none() || b.is_none() || c.is_none() || d.is_none() || e5.is_none() || c2.is_none()
         {
             return -1;
@@ -947,6 +990,8 @@ pub extern "C" fn rust_tasks_init() -> i32 {
         // 直映射已上线, 页表修补在 Rust 里做
         patch_user_region(ue);
         patch_user_region(us);
+        patch_user_region(seg_base);
+        patch_user_region(elf_stack_top - 4096);
         0
     }
 }
