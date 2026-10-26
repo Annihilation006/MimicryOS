@@ -225,8 +225,9 @@ pub extern "C" fn rust_mem_init() -> usize {
             let end = e.ptr.saturating_add(bytes);
             let f0 = ((start + frame::FRAME_SIZE - 1) / frame::FRAME_SIZE) as usize;
             let f1 = ((end + frame::FRAME_SIZE - 1) / frame::FRAME_SIZE) as usize;
-            // 1MB 以下没有恒等映射（页表/堆都在这），跳过 0..256 帧
-            let f0 = f0.max(1536);
+            // 6MB 以下: 恒等映射盲区 + 内核页表 + 直映射表帧 + SPAWN/BRK
+            // 恒等窗口的专属地盘, 分配器从 40MB 起发帧, 井水不犯河水
+            let f0 = f0.max(10240);
             if f1 > f0 {
                 fa.mark_free_range(f0, f1 - f0);
             }
@@ -735,6 +736,10 @@ static mut SPAWN_SEQ: u64 = 0;
 pub static mut SPAWN_DBG: u32 = 0; // 故障码: 6=解析 7=拷贝 8=槽满 0xFF=成功
 const SPAWN_VBASE: u64 = 0x0060_0000; // 6MB, 在帧分配器保留线以上
 
+// 用户态 bump 堆: 16MB 起 4MB 上限, SYS_BRK 按需切清零块
+static mut USER_BRK: u64 = 0x0100_0000;
+const USER_BRK_END: u64 = 0x0140_0000;
+
 /// 把 tmpfs 里的 ELF 镜像装载成 ring3 任务。返回任务槽号, 失败 u64::MAX。
 unsafe fn spawn_elf_image(bin: &[u8]) -> u64 {
     let dbg = core::ptr::addr_of_mut!(SPAWN_DBG);
@@ -1008,6 +1013,28 @@ pub extern "C" fn rust_syscall_entry(frame: *mut syscall::SyscallFrame) -> u64 {
         if f.rax == 12 {
             f.rax = 0;
             return rust_schedule(frame as u64);
+        }
+        // 15 = BRK: rsi = 请求数, 返回清零区指针 (bump 堆, 16MB 起恒等窗口)
+        if f.rax == 15 {
+            let want = if f.rsi > 4096 { 4096 } else { f.rsi };
+            let want = (want + 15) & !15u64;
+            let brk = core::ptr::addr_of_mut!(USER_BRK);
+            if want == 0 || *brk + want > USER_BRK_END {
+                f.rax = u64::MAX;
+                return 0;
+            }
+            let p = *brk;
+            // 区域清零 (恒等或直映射) + 放行为用户可写
+            let kv = if frame::DIRECT {
+                (p + frame::DIRECT_BASE) as *mut u8
+            } else {
+                p as *mut u8
+            };
+            core::ptr::write_bytes(kv, 0, want as usize);
+            patch_user_region(p);
+            *brk += want;
+            f.rax = p;
+            return 0;
         }
         // 14 = SLEEP: rsi = 延迟 (tick, 100Hz), 到点由 tick 钩子唤醒
         if f.rax == 14 {

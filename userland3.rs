@@ -104,6 +104,7 @@ static mut RESP_BUF: [u8; 48] = [0; 48];
 static mut NAME_BUF: [u8; 13] = [0; 13];
 static mut IO_BUF: [u8; 32] = [0; 32];
 static mut FD_TOK: [u32; 8] = [0; 8]; // 客户端 fd → 文件令牌, 0 = 空槽
+static mut FD_NAME: [[u8; 12]; 8] = [[0; 12]; 8]; // 并行的名字绑定
 
 use crate::translator::{self, FsBack};
 
@@ -112,6 +113,29 @@ struct KernelFs;
 impl FsBack for KernelFs {
     fn open(&mut self, name: &[u8]) -> Option<usize> {
         unsafe {
+            // 同名复用: 每轮 RPC 都 sys_open 会漏一个能力槽, 几十轮就耗尽
+            let tab = core::ptr::addr_of_mut!(FD_TOK) as *mut u32;
+            let ntab = core::ptr::addr_of_mut!(FD_NAME) as *mut [u8; 12];
+            let mut i = 0usize;
+            while i < 8 {
+                if *tab.add(i) != 0 {
+                    let bound = &*ntab.add(i);
+                    let mut same = true;
+                    let mut k = 0usize;
+                    while k < 12 {
+                        let want = if k < name.len() { name[k] } else { 0 };
+                        if bound[k] != want {
+                            same = false;
+                            break;
+                        }
+                        k += 1;
+                    }
+                    if same {
+                        return Some(i);
+                    }
+                }
+                i += 1;
+            }
             let nb = core::ptr::addr_of_mut!(NAME_BUF) as *mut u8;
             let mut k = 0usize;
             while k < 12 {
@@ -123,11 +147,16 @@ impl FsBack for KernelFs {
                 return None;
             }
             // 找空 fd 槽
-            let tab = core::ptr::addr_of_mut!(FD_TOK) as *mut u32;
             let mut i = 0usize;
             while i < 8 {
                 if *tab.add(i) == 0 {
                     *tab.add(i) = tok;
+                    let bound = &mut *ntab.add(i);
+                    let mut k = 0usize;
+                    while k < 12 {
+                        *bound.as_mut_ptr().add(k) = if k < name.len() { name[k] } else { 0 };
+                        k += 1;
+                    }
                     return Some(i);
                 }
                 i += 1;

@@ -183,6 +183,20 @@ const SX: i64 = 24;
 const SY: i64 = 253;
 
 const SYS_SPAWN: u64 = 11;
+const SYS_BRK: u64 = 15;
+
+/// bump 堆: 请求 want 字节, 返回清零区指针 (0 = 失败)
+fn sys_brk(want: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        asm!(
+            "int 0x80",
+            in("rax") SYS_BRK, in("rdi") token(), in("rsi") want,
+            lateout("rax") ret,
+        );
+    }
+    ret
+}
 
 /// 让内核把 tmpfs 里的 ELF 文件装载成新 ring3 任务, 返回槽号
 fn sys_spawn(name: *const u8) -> u64 {
@@ -252,6 +266,25 @@ pub extern "C" fn cli_start() -> ! {
                         glyph(b'0' + ((sv / 100) % 10) as u8, SX + 13, SY + 2, col);
                         glyph(b'0' + ((sv / 10) % 10) as u8, SX + 25, SY + 2, col);
                         glyph(b'0' + (sv % 10) as u8, SX + 37, SY + 2, col);
+                        // 堆演示: 分配 32B, 写 "HEAP" 读回核对, 行16 显 B+OK/NO
+                        let hp = sys_brk(32);
+                        if hp != 0 && hp != u64::MAX {
+                            let p = hp as *mut u8;
+                            *p = b'H';
+                            *p.add(1) = b'E';
+                            *p.add(2) = b'A';
+                            *p.add(3) = b'P';
+                            let okh = *p == b'H' && *p.add(1) == b'E' && *p.add(2) == b'A' && *p.add(3) == b'P';
+                            fill(SX, SY + 22, 70, 20, BLACK);
+                            glyph(b'B', SX + 1, SY + 24, if okh { CYAN } else { RED });
+                            if okh {
+                                glyph(b'O', SX + 13, SY + 24, CYAN);
+                                glyph(b'K', SX + 25, SY + 24, CYAN);
+                            } else {
+                                glyph(b'N', SX + 13, SY + 24, RED);
+                                glyph(b'3', SX + 25, SY + 24, RED);
+                            }
+                        }
                     }
                 } else {
                     glyph(b'N', DX + 99, DY + 2, color);
