@@ -12,19 +12,20 @@ pub const UDATA: u64 = 0x23; // 0x20|3
 pub struct Task {
     pub rsp: u64, // 指向 gpr 块; 0 = 还没被打断过
     pub live: bool,
+    pub dead: bool,   // 已退出: 槽位可回收; 阻塞的任务只是 live=false
     pub irq_top: u64, // 该任务的内核中断栈顶 (TSS.RSP0), 0 = 未分配
 }
 
 pub struct Scheduler {
     pub t: [Task; 12],
-    pub n: usize,   // 已占槽（密集分配, 不回收）
+    pub n: usize,   // 已占槽上限（死槽可复用）
     pub cur: usize, // 当前运行槽
 }
 
 impl Scheduler {
     pub const fn new() -> Self {
         Scheduler {
-            t: [Task { rsp: 0, live: false, irq_top: 0 }; 12],
+            t: [Task { rsp: 0, live: false, dead: false, irq_top: 0 }; 12],
             n: 0,
             cur: 0,
         }
@@ -37,7 +38,7 @@ impl Scheduler {
             return usize::MAX;
         }
         let t = core::ptr::addr_of_mut!(self.t) as *mut Task;
-        *t.add(self.n) = Task { rsp: 0, live: true, irq_top: 0 };
+        *t.add(self.n) = Task { rsp: 0, live: true, dead: false, irq_top: 0 };
         self.n += 1;
         self.cur = 0;
         self.n - 1
@@ -107,10 +108,20 @@ impl Scheduler {
         (*t.add(self.cur)).live = false;
     }
 
+    // 退出当前任务: 与阻塞不同, 槽位可回收, wake 救不回来
+    pub unsafe fn exit_cur(&mut self) {
+        let t = core::ptr::addr_of_mut!(self.t) as *mut Task;
+        (*t.add(self.cur)).live = false;
+        (*t.add(self.cur)).dead = true;
+    }
+
     pub unsafe fn wake(&mut self, idx: usize) {
         if idx < self.n {
             let t = core::ptr::addr_of_mut!(self.t) as *mut Task;
-            (*t.add(idx)).live = true;
+            let task = &mut *t.add(idx);
+            if !task.dead {
+                task.live = true;
+            }
         }
     }
 
@@ -135,7 +146,16 @@ impl Scheduler {
         *p.add(20) = stack_top - 8;
         *p.add(21) = ss;
         let t = core::ptr::addr_of_mut!(self.t) as *mut Task;
-        *t.add(self.n) = Task { rsp: frame, live: true, irq_top: 0 };
+        // 死槽复用: 退出任务的槽位给新任务, irq_top 沿用原槽的
+        let mut i = 0usize;
+        while i < self.n {
+            if (*t.add(i)).dead {
+                *t.add(i) = Task { rsp: frame, live: true, dead: false, irq_top: (*t.add(i)).irq_top };
+                return Some(i);
+            }
+            i += 1;
+        }
+        *t.add(self.n) = Task { rsp: frame, live: true, dead: false, irq_top: 0 };
         self.n += 1;
         Some(self.n - 1)
     }
@@ -236,6 +256,26 @@ mod tests {
             s.wake(0);
             // 唤醒后回到 0 号首次被打断的现场
             assert_eq!(s.schedule(0x62_0000), 0x60_0000);
+        }
+    }
+
+    #[test]
+    fn t7_exit_slot_recycled() {
+        let (_s0, t0) = mkstack();
+        let (_s1, t1) = mkstack();
+        let mut s = Scheduler::new();
+        unsafe {
+            s.spawn(0x1000, t0);
+            s.spawn(0x2000, t1);
+            s.exit_cur(); // 0 号退出
+            // wake 救不回退出的任务
+            s.wake(0);
+            assert_eq!(s.schedule(0x60_0000), t1 - 176);
+            // 退出槽位被新任务复用: 槽 0, irq_top 沿用
+            let slot = s.spawn_user(0xBEEF, t0);
+            assert_eq!(slot, Some(0));
+            // 轮转应调度到复用槽
+            assert_eq!(s.schedule(0x61_0000), t0 - 176);
         }
     }
 }

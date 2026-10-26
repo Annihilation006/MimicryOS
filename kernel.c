@@ -18,6 +18,9 @@ typedef unsigned char uint8_t;
 typedef short int16_t;
 
 #include "bootboot.h"
+
+/* [test] shell 按键副本 → 用户态输入队列 (rust 侧 rust_kb_feed) */
+extern void rust_kb_feed(unsigned char c);
 #include "idt.h"
 #include "pic.h"
 #include "console.h"
@@ -652,6 +655,7 @@ void shell(void) {
         }
         
         char c = keyboard_read();
+        rust_kb_feed((unsigned char)c); /* [test] 副本喂给用户态输入队列, shell 行为不变 */
         
         for (int i = 0; i < 8; i++) {
             fb_putpixel(cursor_x * 9 + i, cursor_y * 17 + 15, 0x000000);
