@@ -1312,6 +1312,57 @@ pub extern "C" fn rust_schedule(frame: u64) -> u64 {
 // 页表自举 / fork
 // ============================================================
 
+// 直映射不切 CR3: 在现行页表的空闲 PML4 槽上铺 1GB 大页窗口。
+// 表帧走低分配线以上的恒等映射帧 (恒等可写), 铺完置 DIRECT 标志。
+#[no_mangle]
+pub extern "C" fn rust_direct_map_init(max_phys: u64) -> i32 {
+    unsafe {
+        if frame::DIRECT {
+            return 0;
+        }
+        let fa = match fa_opt() {
+            Some(f) => f,
+            None => return -1,
+        };
+        let pml4 = asm_read_cr3() & 0x000F_FFFF_FFFF_F000;
+        let slot = (frame::DIRECT_BASE >> 39) as usize & 511;
+        let pml4v = pml4 as *mut u64;
+        if *pml4v.add(slot) & 1 != 0 {
+            return -2; // 槽被占
+        }
+        let pdpt = match frame::FrameSource::alloc_frame(fa) {
+            Some(p) => p,
+            None => return -3,
+        };
+        let pdptv = pdpt as *mut u64;
+        core::ptr::write_bytes(pdptv as *mut u8, 0, 4096);
+        let gigs = ((max_phys + 0x3FFF_FFFF) / 0x4000_0000).max(1);
+        let mut g = 0u64;
+        while g < gigs {
+            let pd = match frame::FrameSource::alloc_frame(fa) {
+                Some(p) => p,
+                None => return -3,
+            };
+            let pdv = pd as *mut u64;
+            core::ptr::write_bytes(pdv as *mut u8, 0, 4096);
+            let mut j = 0u64;
+            while j < 512 {
+                let pa = (g << 30) | (j << 21);
+                if pa >= max_phys {
+                    break;
+                }
+                *pdv.add(j as usize) = pa | 1 | 2 | (1 << 7); // P|W|PS
+                j += 1;
+            }
+            *pdptv.add(g as usize) = pd | 1 | 2;
+            g += 1;
+        }
+        *pml4v.add(slot) = pdpt | 1 | 2;
+        frame::DIRECT = true;
+        0
+    }
+}
+
 // 建自己的页表抄高半区+铺直映射然后切过去。max_phys=物理内存上限
 #[no_mangle]
 pub extern "C" fn rust_vm_bootstrap(max_phys: u64) -> i32 {

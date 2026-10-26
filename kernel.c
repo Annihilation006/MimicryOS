@@ -21,6 +21,8 @@ typedef short int16_t;
 
 /* [test] shell 按键副本 → 用户态输入队列 (rust 侧 rust_kb_feed) */
 extern void rust_kb_feed(unsigned char c);
+/* [test] 直映射: 在现行页表空闲槽铺 1GB 大页窗口, 不切 CR3 */
+extern int rust_direct_map_init(unsigned long long max_phys);
 #include "idt.h"
 #include "pic.h"
 #include "console.h"
@@ -899,6 +901,7 @@ void kernel_main(void) {
     pic_remap();
     extern void usermode_init(void);
     usermode_init();            /* [test] GDT/TSS/int0x80 全 asm */
+    rust_direct_map_init(0x40000000ULL); /* [test] 直映射上线 (1GB), 不切 CR3 */
     register_interrupt_handler(32, pit_tick);
     pic_clear_mask(0);          /* IRQ0 计时器 */
     outb(0x43, 0x36);           /* 通道0 方波 */
