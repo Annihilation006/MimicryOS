@@ -165,6 +165,28 @@ const DY: i64 = 202;
 const DW: i64 = 130;
 const DH: i64 = 20;
 
+// spawn 结果行 15 (y=255)
+const SX: i64 = 24;
+const SY: i64 = 253;
+
+const SYS_SPAWN: u64 = 11;
+
+/// 让内核把 tmpfs 里的 ELF 文件装载成新 ring3 任务, 返回槽号
+fn sys_spawn(name: *const u8) -> u64 {
+    let ret: u64;
+    unsafe {
+        asm!(
+            "int 0x80",
+            in("rax") SYS_SPAWN, in("rdi") token(), in("rsi") name,
+            lateout("rax") ret,
+        );
+    }
+    ret
+}
+
+static mut NAME_BUF: [u8; 12] = [0; 12];
+static mut SPAWNED: u8 = 0;
+
 #[no_mangle]
 pub extern "C" fn cli_start() -> ! {
     loop {
@@ -195,6 +217,29 @@ pub extern "C" fn cli_start() -> ! {
                 if ok {
                     glyph(b'O', DX + 99, DY + 2, color);
                     glyph(b'K', DX + 111, DY + 2, color);
+                    // 翻译器通了之后 spawn 一次 hello (SPAWN OK 写 fd2/行14)
+                    if SPAWNED == 0 {
+                        SPAWNED = 1;
+                        let nb = core::ptr::addr_of_mut!(NAME_BUF) as *mut u8;
+                        let nm = b"hello";
+                        let mut k = 0usize;
+                        while k < nm.len() {
+                            *nb.add(k) = nm[k];
+                            k += 1;
+                        }
+                        let slot = sys_spawn(nb);
+                        // 行15: 'S' + 三位 (成功=槽号青色, 失败=故障码红色)
+                        fill(SX, SY, 70, 20, BLACK);
+                        glyph(b'S', SX + 1, SY + 2, CYAN);
+                        let (sv, col) = if slot == u64::MAX {
+                            (core::ptr::read_volatile(&raw const crate::SPAWN_DBG) & 0xFFF, RED)
+                        } else {
+                            (slot.min(999) as u32, CYAN)
+                        };
+                        glyph(b'0' + ((sv / 100) % 10) as u8, SX + 13, SY + 2, col);
+                        glyph(b'0' + ((sv / 10) % 10) as u8, SX + 25, SY + 2, col);
+                        glyph(b'0' + (sv % 10) as u8, SX + 37, SY + 2, col);
+                    }
                 } else {
                     glyph(b'N', DX + 99, DY + 2, color);
                     glyph(b'3', DX + 111, DY + 2, color);

@@ -177,7 +177,16 @@ const BM_WORDS: usize = MAX_FRAMES / frame::WORD_BITS;
 static mut FRAME_BITMAP: [u64; BM_WORDS] = [0; BM_WORDS];
 static mut FRAME_ALLOC: Option<frame::FrameAllocator> = None;
 
+/// 懒初始化: C 侧从不调 rust_mem_init, 第一次要帧时自己拉起分配器
+unsafe fn ensure_frame_alloc() {
+    let p: *mut Option<frame::FrameAllocator> = core::ptr::addr_of_mut!(FRAME_ALLOC);
+    if (*p).is_none() {
+        rust_mem_init();
+    }
+}
+
 unsafe fn fa_opt() -> Option<&'static mut frame::FrameAllocator> {
+    ensure_frame_alloc();
     let p: *mut Option<frame::FrameAllocator> = core::ptr::addr_of_mut!(FRAME_ALLOC);
     (*p).as_mut()
 }
@@ -712,6 +721,74 @@ unsafe fn tlb_flush() {
 // tmpfs 实例: 载荷 open/write, 监视线程 read
 static mut FS: tmpfs::TmpFs = tmpfs::TmpFs::new();
 
+// SYS_SPAWN 的装载窗口: 每个动态进程 2 页 (段 + 栈), 基址递增
+// BOOTBOOT 把 RAM 恒等映射成 2MB 大页, 4K map_page 插不进去 ——
+// 与现有用户区同款打法: 恒等物理页上 patch_user_region 放行, 直映射拷段
+static mut SPAWN_SEQ: u64 = 0;
+pub static mut SPAWN_DBG: u32 = 0; // 故障码: 6=解析 7=拷贝 8=槽满 0xFF=成功
+const SPAWN_VBASE: u64 = 0x0060_0000; // 6MB, 在帧分配器保留线以上
+
+/// 把 tmpfs 里的 ELF 镜像装载成 ring3 任务。返回任务槽号, 失败 u64::MAX。
+unsafe fn spawn_elf_image(bin: &[u8]) -> u64 {
+    let dbg = core::ptr::addr_of_mut!(SPAWN_DBG);
+    *dbg = 0;
+    let seq = SPAWN_SEQ;
+    SPAWN_SEQ += 1;
+    let base = SPAWN_VBASE + seq * 0x2000;
+    // 两页放行为用户可写可执行
+    patch_user_region(base);
+    patch_user_region(base + 0x1000);
+    // 段按差值平移: 镜像里的 p_vaddr 与运行基址可以不同 (代码 RIP 相对寻址)
+    // 直映射没铺之前走恒等 (低 RAM phys==virt), 铺了之后走直映射窗口
+    let seg_virt = if frame::DIRECT {
+        (base + frame::DIRECT_BASE) as *mut u8
+    } else {
+        base as *mut u8
+    };
+    let (img_vaddr, entry0) = match crate::elf::ElfFile::parse(bin) {
+        Ok(e) => {
+            *dbg = 0x60 | (e.seg_count as u32);
+            let mut iv = 0u64;
+            if e.seg_count > 0 {
+                if let Some(s0) = e.segments[0] {
+                    iv = s0.vaddr;
+                }
+            }
+            (iv, e.entry)
+        }
+        Err(_) => {
+            *dbg = 6;
+            return u64::MAX;
+        }
+    };
+    let loaded = elfprog::load(bin, |va, bytes, _| {
+        if va < img_vaddr {
+            return Err(crate::elf::ElfError::TruncatedProgramHeader);
+        }
+        let off = (va - img_vaddr) as usize;
+        if off + bytes.len() > 4096 {
+            return Err(crate::elf::ElfError::TruncatedProgramHeader);
+        }
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), seg_virt.add(off), bytes.len());
+        Ok(())
+    });
+    if loaded.is_err() {
+        *dbg = 7;
+        return u64::MAX;
+    }
+    *dbg = 0xFF;
+    // 入口平移: 镜像内地址 → 运行基址; 栈顶 = 第二页顶端
+    let entry = entry0 - img_vaddr + base;
+    let s: *mut task::Scheduler = core::ptr::addr_of_mut!(SCHED);
+    match (*s).spawn_user(entry, base + 0x2000) {
+        Some(i) => i as u64,
+        None => {
+            *dbg = 8;
+            u64::MAX
+        }
+    }
+}
+
 // ---- 键盘输入队列: shell 的 keyboard_read 钩子喂入, SYS_READ 取走 ----
 // shell 是键盘的唯一读者(别动他的活), 我们只拿副本; 可打印字符 + 换行入队
 static mut KB_BUF: [u8; 32] = [0; 32];
@@ -846,17 +923,46 @@ pub extern "C" fn rust_syscall_entry(frame: *mut syscall::SyscallFrame) -> u64 {
             f.rax = got as u64;
             return 0;
         }
-        // 1 = SYS_WRITE 的 Linux 兼容形态 (fd 1): 文本画到第 11 行 (不走能力门)
-        if f.rax == 1 && f.rdi == 1 {
+        // 1 = SYS_WRITE 的 Linux 兼容形态: fd 1 → 行11, fd 2 → 行14 (不走能力门)
+        if f.rax == 1 && (f.rdi == 1 || f.rdi == 2) {
+            let row = if f.rdi == 2 { 14 } else { 11 };
             let len = if f.rdx > 64 { 64 } else { f.rdx } as usize;
             let src = f.rsi as *const u8;
             let mut k = 0usize;
             while k < len {
                 let ch = *src.add(k);
-                fb_putchar(k as i32, 11, ch, 0x00FF00);
+                fb_putchar(k as i32, row, ch, 0x00FF00);
                 k += 1;
             }
             f.rax = len as u64;
+            return 0;
+        }
+        // 11 = SYS_SPAWN: rsi = tmpfs 文件名 (12B), 读 ELF 镜像装载为 ring3 任务
+        // 段与栈各一物理帧, map_page 挂 USER|W, 新任务占死槽复用位
+        if f.rax == 11 {
+            f.rax = if fb_cap_check(f.rdi as u32) {
+                let mut name = [0u8; tmpfs::NAME_LEN];
+                let src = f.rsi as *const u8;
+                let mut k = 0usize;
+                while k < tmpfs::NAME_LEN {
+                    *(name.as_mut_ptr().add(k)) = *src.add(k);
+                    k += 1;
+                }
+                match FS.open(&name) {
+                    Some(h) => {
+                        let mut bin = [0u8; tmpfs::FILE_CAP];
+                        let n = FS.read(h, 0, &mut bin);
+                        if n == 0 {
+                            u64::MAX
+                        } else {
+                            spawn_elf_image(&bin[..n])
+                        }
+                    }
+                    None => u64::MAX,
+                }
+            } else {
+                u64::MAX
+            };
             return 0;
         }
         if f.rax == 4 {
@@ -1118,6 +1224,22 @@ pub extern "C" fn rust_tasks_init() -> i32 {
             None => return -4,
         };
         if FS.write(fh, 0, core::slice::from_raw_parts(img, img_len)) != img_len {
+            return -4;
+        }
+        // spawn 演示程序: 写 "SPAWN OK" 到 fd 2 (行14) 后退出, 供 SYS_SPAWN 装载
+        static mut HELLO_IMG: [u8; 256] = [0; 256];
+        let hp = core::ptr::addr_of_mut!(HELLO_IMG) as *mut u8;
+        let hn = elfprog::build_image_msg(
+            core::slice::from_raw_parts_mut(hp, 256),
+            0x0040_0000,
+            2,
+            *b"SPAWN OK",
+        );
+        let hh = match FS.open(b"hello") {
+            Some(h) => h,
+            None => return -4,
+        };
+        if FS.write(hh, 0, core::slice::from_raw_parts(hp, hn)) != hn {
             return -4;
         }
         // 2) 从文件读回, 解析并装载

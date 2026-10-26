@@ -1,6 +1,7 @@
 //! 内嵌的最小 ELF 用户程序与其装载入口
-//! 镜像内容：向 fd 1 写一行文本后调用 SYS_EXIT(60)。
-//! 段的虚拟基址由调用方给出（内核侧为 .bss 中已放行的用户页）。
+//! 镜像内容：向指定 fd 写一行 8 字节文本后调用 SYS_EXIT(60)。
+//! 代码 RIP 相对寻址 → 位置无关, 运行时可装载到任意页对齐地址;
+//! 段的虚拟基址仅用于镜像里的 p_vaddr/入口字段的演练, 装载方按差值平移。
 //!
 //! 裸机构建注意：所有字节操作都在定长局部数组上以常量范围完成，
 //! 出口用一次 copy_nonoverlapping 拷到调用方缓冲——运行期索引会
@@ -8,47 +9,50 @@
 
 use crate::elf::{ElfError, ElfFile, Elf64Header, Elf64ProgramHeader, ELF_CLASS_64, ELF_DATA_2LSB, ELF_MAGIC, EM_X86_64, PF_R, PF_X, PT_LOAD};
 
-pub const MSG: &[u8] = b"ELF OK\n";
+pub const MSG_LEN: usize = 8;
 
 const EH: usize = core::mem::size_of::<Elf64Header>();
 const PH: usize = core::mem::size_of::<Elf64ProgramHeader>();
 pub const CODE_OFF: usize = EH + PH;
-const CODE_LEN: usize = 36;
-pub const IMG_LEN: usize = CODE_OFF + CODE_LEN + MSG.len();
+// mov eax(5) + mov edi(5) + lea rip相对(7) + mov edx(5) + int(2) + mov eax(5) + int(2) + jmp(2)
+pub const CODE_LEN: usize = 33;
+pub const IMG_LEN: usize = CODE_OFF + CODE_LEN + MSG_LEN;
 
-/// 机器码模板（offset 12..20 = msg 地址, 21..25 = msg 长度 占位）:
+// lea rsi,[rip+disp32] 的 disp: 指令止于偏移 17, 消息在偏移 CODE_LEN → 差 = CODE_LEN-17
+const MSG_DISP: i32 = (CODE_LEN - 17) as i32;
+const _: () = assert!(MSG_DISP == 16, "lea disp 布局变了");
+
+/// 机器码模板（offset 6 = fd）:
 ///   mov eax, 1          ; SYS_WRITE
-///   mov edi, 1          ; fd = 1
-///   mov rsi, msg        ; 消息地址
-///   mov edx, len        ; 长度
+///   mov edi, fd         ; 1 → 行11, 2 → 行14
+///   lea rsi, [rip+d]    ; 消息 (位置无关)
+///   mov edx, 8          ; 长度
 ///   int 0x80
 ///   mov eax, 60         ; SYS_EXIT
 ///   int 0x80
 ///   jmp $
 const CODE_TMPL: [u8; CODE_LEN] = [
     0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
-    0xBF, 0x01, 0x00, 0x00, 0x00, // mov edi, 1
-    0x48, 0xBE, // mov rsi, imm64
-    0, 0, 0, 0, 0, 0, 0, 0, //   <- msg 地址
-    0xBA, 0, 0, 0, 0, // mov edx, imm32
+    0xBF, 0x01, 0x00, 0x00, 0x00, // mov edi, fd (offset 6)
+    0x48, 0x8D, 0x35, 16, 0, 0, 0, // lea rsi, [rip+16]
+    0xBA, MSG_LEN as u8, 0, 0, 0, // mov edx, 8
     0xCD, 0x80, // int 0x80
     0xB8, 0x3C, 0x00, 0x00, 0x00, // mov eax, 60
     0xCD, 0x80, // int 0x80
     0xEB, 0xFE, // jmp $
 ];
 
-fn code_bytes(msg_addr: u64) -> [u8; CODE_LEN] {
+fn code_bytes(fd: u8) -> [u8; CODE_LEN] {
     let mut c = CODE_TMPL;
-    c[12..20].copy_from_slice(&msg_addr.to_le_bytes());
-    c[21..25].copy_from_slice(&(MSG.len() as u32).to_le_bytes());
+    c[6] = fd;
     c
 }
 
-/// 把镜像写入 out（段虚拟基址为 base），返回总长度。
-/// 要求 out.len() >= IMG_LEN (127)。
-pub fn build_image(out: &mut [u8], base: u64) -> usize {
+/// 把镜像写入 out（段虚拟基址 base, 写往 fd, 消息 8 字节定长），返回总长度。
+/// 要求 out.len() >= IMG_LEN (161)。
+pub fn build_image_msg(out: &mut [u8], base: u64, fd: u8, msg: [u8; MSG_LEN]) -> usize {
     let mut buf = [0u8; IMG_LEN];
-    let code = code_bytes(base + (CODE_OFF + CODE_LEN) as u64);
+    let code = code_bytes(fd);
 
     buf[0..4].copy_from_slice(&ELF_MAGIC);
     buf[4] = ELF_CLASS_64;
@@ -74,12 +78,17 @@ pub fn build_image(out: &mut [u8], base: u64) -> usize {
     buf[p + 48..p + 56].copy_from_slice(&0x1000u64.to_le_bytes());
 
     buf[CODE_OFF..CODE_OFF + CODE_LEN].copy_from_slice(&code);
-    buf[CODE_OFF + CODE_LEN..IMG_LEN].copy_from_slice(MSG);
+    buf[CODE_OFF + CODE_LEN..IMG_LEN].copy_from_slice(&msg);
 
     unsafe {
         core::ptr::copy_nonoverlapping(buf.as_ptr(), out.as_mut_ptr(), IMG_LEN);
     }
     IMG_LEN
+}
+
+/// 缺省消息 "ELF OK\n"
+pub fn build_image(out: &mut [u8], base: u64) -> usize {
+    build_image_msg(out, base, 1, *b"ELF OK\n\0")
 }
 
 /// 装载：逐段回调 map_fn(目的虚拟地址, 段内容, 段权限)，返回入口地址。
@@ -118,8 +127,23 @@ mod tests {
         let mut buf = [0u8; 256];
         let n = build_image(&mut buf, 0x0040_0000);
         let code = &buf[CODE_OFF..CODE_OFF + CODE_LEN];
-        assert_eq!(&code[10..12], &[0x48, 0xBE]);
+        assert_eq!(&code[10..12], &[0x48, 0x8D]); // lea rip 相对
         assert_eq!(&code[CODE_LEN - 2..], &[0xEB, 0xFE]);
-        assert_eq!(&buf[CODE_OFF + CODE_LEN..n], MSG);
+        assert_eq!(&buf[CODE_OFF + CODE_LEN..n], b"ELF OK\n\0");
+    }
+
+    #[test]
+    fn msg_variant_carries_fd_and_text() {
+        let mut buf = [0u8; 256];
+        let n = build_image_msg(&mut buf, 0x0040_0000, 2, *b"SPAWN OK");
+        let code = &buf[CODE_OFF..CODE_OFF + CODE_LEN];
+        assert_eq!(code[6], 2); // fd=2
+        assert_eq!(&buf[CODE_OFF + CODE_LEN..n], b"SPAWN OK");
+        // lea 的 disp 指向消息起点: 指令止于 17, 目标在 CODE_LEN
+        let disp = i32::from_le_bytes([code[13], code[14], code[15], code[16]]);
+        assert_eq!(disp as usize, CODE_LEN - 17);
+        // 位置无关: 换基址装载, 入口随差值平移
+        let entry = load(&buf[..n], |_, _, _| Ok(())).unwrap();
+        assert_eq!(entry, 0x0040_0000 + CODE_OFF as u64);
     }
 }
