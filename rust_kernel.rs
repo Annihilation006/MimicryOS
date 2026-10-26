@@ -1347,6 +1347,47 @@ pub extern "C" fn rust_tick_hook() {
     }
 }
 
+// shell 的 run 命令入口: 按名装载 tmpfs ELF 为新任务, 返回槽号 (u64::MAX=败)
+// dbg 标记: 0xC0=入口 0xC1=open 成功 0xC2=读完成 0xC3=装载完成 0xCE=open 败
+#[no_mangle]
+pub extern "C" fn rust_spawn_file(name: *const u8) -> u64 {
+    unsafe {
+        let dbg = core::ptr::addr_of_mut!(SPAWN_DBG);
+        *dbg = 0xC0;
+        let mut nm = [0u8; tmpfs::NAME_LEN];
+        let mut k = 0usize;
+        // C 串语义: 首个 NUL 之后全按 0 填, 不把 cmd 缓冲的残渣带进文件名
+        let mut nul = false;
+        while k < tmpfs::NAME_LEN {
+            let c = if nul { 0 } else { *name.add(k) };
+            if c == 0 {
+                nul = true;
+            }
+            *(nm.as_mut_ptr().add(k)) = c;
+            k += 1;
+        }
+        match FS.open(&nm) {
+            Some(h) => {
+                *dbg = 0xC1;
+                let mut bin = [0u8; tmpfs::FILE_CAP];
+                let n = FS.read(h, 0, &mut bin);
+                if n == 0 {
+                    *dbg = 0xCD;
+                    return u64::MAX;
+                }
+                *dbg = 0xC0 | (n as u32 & 0xFF); // 读到的长度低 8 位
+                let r = spawn_elf_image(&bin[..n]);
+                *dbg = 0xC3;
+                r
+            }
+            None => {
+                *dbg = 0xCE;
+                u64::MAX
+            }
+        }
+    }
+}
+
 // pit_tick 取线程计数做单点渲染
 #[no_mangle]
 pub extern "C" fn rust_thread_counts(which: u32) -> u32 {

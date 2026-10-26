@@ -13,6 +13,7 @@ pub struct Task {
     pub rsp: u64, // 指向 gpr 块; 0 = 还没被打断过
     pub live: bool,
     pub dead: bool,   // 已退出: 槽位可回收; 阻塞的任务只是 live=false
+    pub prio: u8,     // 优先级, 数小者优先, 默认 1
     pub irq_top: u64, // 该任务的内核中断栈顶 (TSS.RSP0), 0 = 未分配
 }
 
@@ -36,7 +37,7 @@ pub struct Scheduler {
 impl Scheduler {
     pub const fn new() -> Self {
         Scheduler {
-            t: [Task { rsp: 0, live: false, dead: false, irq_top: 0 }; 12],
+            t: [Task { rsp: 0, live: false, dead: false, prio: 1, irq_top: 0 }; 12],
             n: 0,
             cur: 0,
             sleepers: [Sleeper { task: 0, deadline: 0, used: false }; NSLEEP],
@@ -50,7 +51,7 @@ impl Scheduler {
             return usize::MAX;
         }
         let t = core::ptr::addr_of_mut!(self.t) as *mut Task;
-        *t.add(self.n) = Task { rsp: 0, live: true, dead: false, irq_top: 0 };
+        *t.add(self.n) = Task { rsp: 0, live: true, dead: false, prio: 1, irq_top: 0 };
         self.n += 1;
         self.cur = 0;
         self.n - 1
@@ -64,6 +65,14 @@ impl Scheduler {
         }
     }
 
+    // 调优先级: 数小者优先
+    pub unsafe fn set_prio(&mut self, idx: usize, prio: u8) {
+        if idx < self.n {
+            let t = core::ptr::addr_of_mut!(self.t) as *mut Task;
+            (*t.add(idx)).prio = prio;
+        }
+    }
+
     // stack_top 必须页对齐; 入口永远不返回
     pub unsafe fn spawn(&mut self, entry: u64, stack_top: u64) -> Option<usize> {
         self.spawn_with(entry, stack_top, KCODE, KDATA)
@@ -71,28 +80,43 @@ impl Scheduler {
 
     // 每 tick 被调: frame=当前现场位置。返回下一个该跑的 rsp, 单任务原样返回
     // 别用 %: 运行时取余会生成除零 panic 桩, 裸机链不上
+    // 优先级: 数小者优先; 同级轮转。当前任务已是最高优先级就原样返回不切
     pub unsafe fn schedule(&mut self, frame: u64) -> u64 {
         if self.n <= 1 {
             return frame;
         }
         let t = core::ptr::addr_of_mut!(self.t) as *mut Task;
         (*t.add(self.cur)).rsp = frame;
-        let mut i = self.cur + 1;
-        if i >= self.n {
-            i = 0;
-        }
-        while !(*t.add(i)).live {
+        // 找最高优先级 (数最小) 的活任务; 同级取 cur 之后最近的
+        let mut best = usize::MAX;
+        let mut best_prio = 255u8;
+        let mut i = self.cur;
+        let mut steps = 0usize;
+        while steps < self.n {
             i += 1;
             if i >= self.n {
                 i = 0;
             }
+            steps += 1;
+            let task = &*t.add(i);
+            if task.live && task.prio < best_prio {
+                best_prio = task.prio;
+                best = i;
+            }
         }
-        self.cur = i;
+        if best == usize::MAX {
+            return frame; // 没有别的活任务
+        }
+        let cur_task = &*t.add(self.cur);
+        if cur_task.live && cur_task.prio < best_prio {
+            return frame; // 当前任务严格更高: 独占; 同级照常轮转
+        }
+        self.cur = best;
         // 切到 ring3 任务前换它自己的中断栈, 不然大家的帧在 RSP0 上互相踩
         // (宿主测试里没有 tss 符号, cfg 隔离)
         #[cfg(not(test))]
         {
-            let top = (*t.add(i)).irq_top;
+            let top = (*t.add(best)).irq_top;
             if top != 0 {
                 extern "C" {
                     static tss: u8;
@@ -101,8 +125,8 @@ impl Scheduler {
             }
         }
         #[cfg(test)]
-        let _ = (*t.add(i)).irq_top;
-        (*t.add(i)).rsp
+        let _ = (*t.add(best)).irq_top;
+        (*t.add(best)).rsp
     }
 
     // ring3 任务: 帧带用户段选择子, iretq 直接落用户态
@@ -195,12 +219,12 @@ impl Scheduler {
         let mut i = 0usize;
         while i < self.n {
             if (*t.add(i)).dead {
-                *t.add(i) = Task { rsp: frame, live: true, dead: false, irq_top: (*t.add(i)).irq_top };
+                *t.add(i) = Task { rsp: frame, live: true, dead: false, prio: 1, irq_top: (*t.add(i)).irq_top };
                 return Some(i);
             }
             i += 1;
         }
-        *t.add(self.n) = Task { rsp: frame, live: true, dead: false, irq_top: 0 };
+        *t.add(self.n) = Task { rsp: frame, live: true, dead: false, prio: 1, irq_top: 0 };
         self.n += 1;
         Some(self.n - 1)
     }
@@ -353,5 +377,48 @@ mod tests {
         // 退出任务的睡眠项到点也不该把它救活 (wake 忽略 dead)
         unsafe { s.exit_cur() };
         assert_eq!(s.sleep_wake(1000), NSLEEP - 1);
+    }
+
+    #[test]
+    fn t9_priority_preempts() {
+        let (_s0, t0) = mkstack();
+        let (_s1, t1) = mkstack();
+        let (_s2, t2) = mkstack();
+        let mut s = Scheduler::new();
+        unsafe {
+            s.spawn(0x1000, t0);
+            s.spawn(0x2000, t1);
+            s.spawn(0x3000, t2);
+        }
+        // 2 号提为高优先级 (数小): 无论轮到谁, tick 一来就切到 2 号
+        unsafe { s.set_prio(2, 0); }
+        unsafe {
+            assert_eq!(s.schedule(0x50_0000), t2 - 176);
+            // 2 号再次被打断: 存的是新现场, 恢复也用新现场
+            assert_eq!(s.schedule(0x51_0000), 0x51_0000);
+        }
+        // 高优先级阻塞后回落到普通轮转 (0 号的保存现场是它上次被打断处)
+        unsafe { s.block_cur() };
+        unsafe { s.set_prio(2, 1); }
+        unsafe {
+            assert_eq!(s.schedule(0x52_0000), 0x50_0000);
+        }
+    }
+
+    #[test]
+    fn t10_same_prio_round_robins() {
+        let (_s0, t0) = mkstack();
+        let (_s1, t1) = mkstack();
+        let mut s = Scheduler::new();
+        unsafe {
+            s.spawn(0x1000, t0);
+            s.spawn(0x2000, t1);
+        }
+        // 同级不打压: 依然轮转; 恢复现场 = 各自上次被打断处
+        unsafe {
+            assert_eq!(s.schedule(0x50_0000), t1 - 176);
+            assert_eq!(s.schedule(0x51_0000), 0x50_0000);
+            assert_eq!(s.schedule(0x52_0000), 0x51_0000);
+        }
     }
 }

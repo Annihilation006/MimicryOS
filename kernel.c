@@ -23,6 +23,8 @@ typedef short int16_t;
 extern void rust_kb_feed(unsigned char c);
 /* [test] 直映射: 在现行页表空闲槽铺 1GB 大页窗口, 不切 CR3 */
 extern int rust_direct_map_init(unsigned long long max_phys);
+/* [test] run 命令: tmpfs ELF → 新任务 */
+extern unsigned long long rust_spawn_file(unsigned char *name);
 #include "idt.h"
 #include "pic.h"
 #include "console.h"
@@ -682,7 +684,7 @@ void shell(void) {
                 fb_print("Commands: clear about modules memory scan sysinfo\n");
                 fb_print("  ls desktop mkfile format cat del dir disk\n");
                 fb_print("  date echo whoami touch write size rm type\n");
-                fb_print("  reboot shutdown\n");
+                fb_print("  reboot shutdown run <file>\n");
                 user_prompt();
             } else if (cmd[0] == 'c' && cmd[1] == 'l' && cmd[2] == 'e' && cmd[3] == 'a' && cmd[4] == 'r' && cmd[5] == '\0') {
                 fb_fill(0x000000);
@@ -786,6 +788,17 @@ void shell(void) {
                 outw(0x5301, 0x0000);
                 outw(0x530E, 0x0000);
                 outw(0x5307, 0x0001);
+            } else if (cmd[0] == 'r' && cmd[1] == 'u' && cmd[2] == 'n' && cmd[3] == ' ' && cmd[4]) {
+                /* [test] run <name>: 把 tmpfs 里的 ELF 文件装载为新任务 */
+                unsigned long long slot = rust_spawn_file(&cmd[4]);
+                if (slot == 0xFFFFFFFFFFFFFFFFULL) {
+                    fb_print("[run] failed\n");
+                } else {
+                    fb_print("[run] slot=");
+                    print_int((int)slot);
+                    fb_print("\n");
+                }
+                user_prompt();
             } else {
                 fb_print("Unknown command: ");
                 fb_print(cmd);
