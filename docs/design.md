@@ -41,16 +41,26 @@
 | translator | 无 | 用户态 VFS 翻译器纯逻辑核 serve(FsBack) | MemFs 替身，4 项 |
 | 集成 | frame+pagetable+vma | — | test_root.rs，3 项 |
 
-**Ring3 任务表**（调度器容量 12，现用 10）：
-0 kernel_main · 1-4 内核线程 · 5 userland · 6 userland2(VMO读数)
-· 7 ELF 任务（tmpfs 装载）· 8 userland3(VFS 翻译器服务) · 9 userland4(VFS 客户端)
+**Ring3 任务表**（调度器容量 12，现用 11）：
+0 kernel_main/shell · 1-4 内核线程 · 5 userland · 6 userland2(VMO读数+心跳)
+· 7 ELF 任务（tmpfs 装载，退出后槽被回收）· 8 userland3(VFS 翻译器服务)
+· 9 userland4(VFS 客户端 + SYS_SPAWN 演示) · 10 userland5(键盘回显)
 
 **IPC 通道表**（NCHAN=3）：0 任务A→ipc服务 · 1 翻译器请求 · 2 翻译器应答。
 recv 系统调用按端点令牌路由；空通道登记每通道等待者后阻塞。
 
-**系统调用号**：1 画点/write · 2 字形 · 4 IPC_SEND · 5 IPC_RECV · 6 OPEN
-· 7 WRF · 8 RDF · 9 VMO_CREATE · 10 VMO_GETADDR · 12 YIELD · 13 FILL
-· 60 EXIT。0 read（兼容桩）。
+**系统调用号**：0 read(键盘队列, 空则阻塞) · 1 画点/write(fd1→行11,
+fd2→行14) · 2 字形 · 4 IPC_SEND · 5 IPC_RECV · 6 OPEN · 7 WRF · 8 RDF
+· 9 VMO_CREATE · 10 VMO_GETADDR · 11 SPAWN(tmpfs ELF→新任务) · 12 YIELD
+· 13 FILL(先擦后画) · 14 SLEEP(tick 定时, 睡眠表 8 项) · 60 EXIT(死槽回收)。
+
+**定时**：kernel.c pit_tick 首行调 rust_tick_hook（每 tick）——Rust 自持
+RUST_TICKS 并唤醒到点睡眠任务。
+
+**直映射**：rust_direct_map_init 在现行页表空闲 PML4 槽（272）铺 1GB
+大页窗口（0xFFFF_8800_0000_0000 起），不切 CR3；DIRECT 标志置位后
+frame_to_virt 与 spawn 的段拷贝走该窗口。rust_vm_bootstrap（切 CR3 版）
+封存备用。
 
 **FrameSource** 是 Rust 侧的供给接口：`alloc_frame/free_frame/frame_to_virt`。
 内核实现依赖 BOOTBOOT 的低地址身份映射（phys == virt）；一旦内核建立
