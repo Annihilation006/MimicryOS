@@ -70,10 +70,9 @@ impl TmpFs {
         }
         let room = FILE_CAP - off;
         let n = if src.len() < room { src.len() } else { room };
-        let mut k = 0;
-        while k < n {
-            e.data[off + k] = src[k];
-            k += 1;
+        // 裸拷贝: 裸机链接没有 panic_bounds_check 可用
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), e.data.as_mut_ptr().add(off), n);
         }
         if off + n > e.size {
             e.size = off + n;
@@ -90,12 +89,15 @@ impl TmpFs {
         if !e.used {
             return 0;
         }
-        let avail = if e.size > off { e.size - off } else { 0 };
+        let cap = FILE_CAP - off;
+        let mut avail = if e.size > off { e.size - off } else { 0 };
+        // e.size 由 write 维护恒 ≤ FILE_CAP, 但编译器看不见, 钳一次拿可证上界
+        if avail > cap {
+            avail = cap;
+        }
         let want = if dst.len() < avail { dst.len() } else { avail };
-        let mut k = 0;
-        while k < want {
-            dst[k] = e.data[off + k];
-            k += 1;
+        unsafe {
+            core::ptr::copy_nonoverlapping(e.data.as_ptr().add(off), dst.as_mut_ptr(), want);
         }
         want
     }

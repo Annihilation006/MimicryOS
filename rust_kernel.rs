@@ -956,7 +956,8 @@ pub extern "C" fn rust_tasks_init() -> i32 {
         let c = (*s).spawn_user(ue, us);
         let u2 = userland2::user2_start as u64;
         let c2 = (*s).spawn_user(u2, userland2::stack_top());
-        // ELF 任务: 镜像装到静态缓冲, 段拷进 LOAD_BASE 处的专属页, 入口取 e_entry
+        // ELF 任务: 镜像先落 tmpfs 文件 "init", 再从文件读回解析装载
+        // —— 打通 文件系统 → ELF 解析 → ring3 进程 的完整链路
         static mut ELF_IMG: [u8; 512] = [0; 512];
         static mut ELF_SEG: [u8; 0x1000] = [0; 0x1000];
         static mut ELF_STACK: [u8; 4096] = [0; 4096];
@@ -964,7 +965,17 @@ pub extern "C" fn rust_tasks_init() -> i32 {
         let seg_base = core::ptr::addr_of_mut!(ELF_SEG) as u64;
         // 段虚拟基址 = 段实际地址, 装载即按恒等地址拷贝, 无需额外建页
         let img_len = elfprog::build_image(core::slice::from_raw_parts_mut(img, 512), seg_base);
-        let elf_entry = elfprog::load(core::slice::from_raw_parts(img, img_len), |va, bytes, _| {
+        // 1) 镜像落盘
+        let fh = match FS.open(b"init") {
+            Some(h) => h,
+            None => return -4,
+        };
+        if FS.write(fh, 0, core::slice::from_raw_parts(img, img_len)) != img_len {
+            return -4;
+        }
+        // 2) 从文件读回, 解析并装载
+        let bin_len = FS.read(fh, 0, core::slice::from_raw_parts_mut(img, 512));
+        let elf_entry = elfprog::load(core::slice::from_raw_parts(img, bin_len), |va, bytes, _| {
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), va as *mut u8, bytes.len());
             Ok(())
         });

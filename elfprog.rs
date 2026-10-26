@@ -12,9 +12,9 @@ pub const MSG: &[u8] = b"ELF OK\n";
 
 const EH: usize = core::mem::size_of::<Elf64Header>();
 const PH: usize = core::mem::size_of::<Elf64ProgramHeader>();
-const CODE_OFF: usize = EH + PH;
+pub const CODE_OFF: usize = EH + PH;
 const CODE_LEN: usize = 36;
-const IMG_LEN: usize = CODE_OFF + CODE_LEN + MSG.len();
+pub const IMG_LEN: usize = CODE_OFF + CODE_LEN + MSG.len();
 
 /// 机器码模板（offset 12..20 = msg 地址, 21..25 = msg 长度 占位）:
 ///   mov eax, 1          ; SYS_WRITE
