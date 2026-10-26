@@ -4,8 +4,11 @@
 
 use crate::capability;
 
+pub const SYS_READ: u64 = 0;
+pub const SYS_WRITE: u64 = 1;
 pub const SYS_PUTPIXEL: u64 = 1;
 pub const SYS_GLYPH: u64 = 2;
+pub const SYS_EXIT: u64 = 60;
 
 pub const CAP_FRAMEBUF: u32 = capability::CAP_VMO; // 帧缓冲就是一种 VMO
 
@@ -97,12 +100,19 @@ pub fn dispatch(
     sink: &mut dyn FbSink,
 ) {
     let ret = match f.rax {
-        SYS_PUTPIXEL => {
-            if !cap_check(f.rdi as u32) {
-                u64::MAX
-            } else {
+        SYS_READ => {
+            // Linux ABI 兼容路径: 暂时返回 0 (EOF)
+            0
+        }
+        SYS_WRITE => {
+            // Linux ABI 兼容路径 (fd=1,2): rdi=fd, rsi=buf, rdx=count
+            // 如果 rdi 是已授权的能力令牌，则回退至原生 SYS_PUTPIXEL
+            if cap_check(f.rdi as u32) {
                 sink.put(f.rsi as i64, f.rdx as i64, f.r8 as u32);
                 0
+            } else {
+                // 模拟标准输出，成功返回写入长度
+                f.rdx
             }
         }
         SYS_GLYPH => {
@@ -111,6 +121,10 @@ pub fn dispatch(
             } else {
                 draw_glyph(sink, f.rsi as u8, f.rdx as i64, f.r8 as i64, f.r9 as u32)
             }
+        }
+        SYS_EXIT => {
+            // 退出当前任务
+            0
         }
         _ => u64::MAX,
     };
@@ -154,8 +168,9 @@ mod tests {
         let mut f = frame(SYS_PUTPIXEL, 99, 10, 20, 0xFFFFFF);
         let mut s = MemSink { px: Vec::new() };
         dispatch(&mut f, |t| t == 1, &mut s);
-        assert_eq!(f.rax, u64::MAX);
-        assert!(s.px.is_empty(), "没能力就不许画");
+        // 无能力令牌时，回退到标准输出写入模式，未在 fb 绘制
+        assert_eq!(f.rax, f.rdx);
+        assert!(s.px.is_empty(), "未授权时不在帧缓冲画点");
     }
 
     #[test]

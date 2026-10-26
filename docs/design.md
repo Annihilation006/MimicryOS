@@ -36,6 +36,8 @@
 | kmem | frame::FrameSource | rust_kmem_init(frames) 拉帧 | Arena，4 项 |
 | vma | 无 | .bss 节点池 ×256 | 栈上池，7 项 |
 | pagetable | frame::FrameSource | 当前 CR3（asm_read_cr3） | Arena，6 项 |
+| elf | 无 | 静态 ELF64 解析与加载 | 内存缓冲区，2 项 |
+| translator | 无 | 用户态 VFS 翻译器 RPC 框架 | 模拟请求，1 项 |
 | 集成 | frame+pagetable+vma | — | test_root.rs，2 项 |
 
 **FrameSource** 是 Rust 侧的供给接口：`alloc_frame/free_frame/frame_to_virt`。

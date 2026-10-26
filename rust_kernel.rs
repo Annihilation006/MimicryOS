@@ -48,6 +48,10 @@ mod userland;
 mod userland2;
 #[path = "tmpfs.rs"]
 mod tmpfs;
+#[path = "elf.rs"]
+mod elf;
+#[path = "translator.rs"]
+mod translator;
 
 use core::panic::PanicInfo;
 
