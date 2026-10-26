@@ -46,6 +46,10 @@ mod syscall;
 mod userland;
 #[path = "userland2.rs"]
 mod userland2;
+#[path = "userland3.rs"]
+mod userland3;
+#[path = "userland4.rs"]
+mod userland4;
 #[path = "tmpfs.rs"]
 mod tmpfs;
 #[path = "elf.rs"]
@@ -363,6 +367,7 @@ pub extern "C" fn rust_unmap_page(vaddr: u64) -> i32 {
 
 const NCAPS: usize = 256;
 const NCHMSG: usize = 32;
+const NCHAN: usize = 3; // 0=ipc服务 1=VFS翻译器请求 2=VFS翻译器应答
 const NVMO: usize = 8;
 
 static mut CAP_NODES: [capability::CapNode; NCAPS] =
@@ -371,9 +376,9 @@ static mut CAP_USED: [bool; NCAPS] = [false; NCAPS];
 static mut CAP_FREE: [u32; NCAPS] = [0; NCAPS];
 static mut CAPS: Option<capability::CSpace> = None;
 
-static mut CH_STORAGE: [ipc::Message; NCHMSG] =
-    [ipc::Message { cap: 0, len: 0, data: [0; ipc::MSG_PAYLOAD] }; NCHMSG];
-static mut CHAN: Option<ipc::Channel> = None;
+static mut CH_STORAGE: [[ipc::Message; NCHMSG]; NCHAN] =
+    [[ipc::Message { cap: 0, len: 0, data: [0; ipc::MSG_PAYLOAD] }; NCHMSG]; NCHAN];
+static mut CHAN: [Option<ipc::Channel>; NCHAN] = [None, None, None];
 
 static mut VMO_TABLE: [ipc::Vmo; NVMO] =
     [ipc::Vmo { frames: [0; ipc::VMO_MAX_PAGES], npages: 0, refs: 0 }; NVMO];
@@ -441,13 +446,41 @@ pub extern "C" fn rust_cap_lookup(slot: u32, out_type: *mut u32, out_id: *mut u3
 #[no_mangle]
 pub extern "C" fn rust_ipc_channel_init() -> i32 {
     unsafe {
-        let p: *mut Option<ipc::Channel> = core::ptr::addr_of_mut!(CHAN);
-        *p = Some(ipc::Channel::new(
-            core::ptr::addr_of_mut!(CH_STORAGE) as *mut ipc::Message,
-            NCHMSG,
-        ));
+        let base = core::ptr::addr_of_mut!(CHAN) as *mut Option<ipc::Channel>;
+        let stor = core::ptr::addr_of_mut!(CH_STORAGE) as *mut ipc::Message;
+        let mut i = 0usize;
+        while i < NCHAN {
+            *(base.add(i)) = Some(ipc::Channel::new(stor.add(i * NCHMSG), NCHMSG));
+            i += 1;
+        }
     }
     0
+}
+
+/// 端点令牌 → (通道号, 通道). 令牌必须是 CAP_ENDPOINT 且 id 落在通道表内
+unsafe fn ep_channel(token: u32) -> Option<(usize, *mut ipc::Channel)> {
+    let c = caps_opt()?;
+    match (*c).lookup(token) {
+        Some((t, id)) if t == capability::CAP_ENDPOINT && (id as usize) < NCHAN => {
+            let base = core::ptr::addr_of_mut!(CHAN) as *mut Option<ipc::Channel>;
+            match (*base.add(id as usize)).as_mut() {
+                Some(ch) => Some((id as usize, ch as *mut ipc::Channel)),
+                None => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// 通道 c 上有新消息就把登记的等待者叫醒 (发送侧统一负责)
+unsafe fn chan_wake(c: usize) {
+    let w = core::ptr::addr_of_mut!(CHAN_WAITER) as *mut usize;
+    let idx = *w.add(c);
+    if idx != usize::MAX {
+        let s: *mut task::Scheduler = core::ptr::addr_of_mut!(SCHED);
+        (*s).wake(idx);
+        *w.add(c) = usize::MAX;
+    }
 }
 
 #[no_mangle]
@@ -456,10 +489,11 @@ pub extern "C" fn rust_ipc_send(cap: u32, buf: *const u8, len: u64) -> i32 {
     if len > ipc::MSG_PAYLOAD {
         return -2;
     }
-    let ch = match unsafe { (&mut *core::ptr::addr_of_mut!(CHAN)).as_mut() } {
-        Some(c) => c,
+    let (cid, chp) = match unsafe { ep_channel(cap) } {
+        Some(x) => x,
         None => return -3,
     };
+    let ch = unsafe { &mut *chp };
     let mut m = ipc::Message { cap, len: len as u16, data: [0; ipc::MSG_PAYLOAD] };
     unsafe {
         let dst = m.data.as_mut_ptr();
@@ -468,14 +502,50 @@ pub extern "C" fn rust_ipc_send(cap: u32, buf: *const u8, len: u64) -> i32 {
         }
     }
     match ch.send(&m) {
-        Ok(()) => 0,
+        Ok(()) => {
+            unsafe { chan_wake(cid) };
+            0
+        }
+        Err(_) => -1,
+    }
+}
+
+/// 内核线程直接往指定通道投递 (翻译器应答用), 唤醒逻辑同上
+unsafe fn chan_send_to(cid: usize, buf: &[u8], cap: u32) -> i32 {
+    if cid >= NCHAN || buf.len() > ipc::MSG_PAYLOAD {
+        return -2;
+    }
+    let base = core::ptr::addr_of_mut!(CHAN) as *mut Option<ipc::Channel>;
+    let ch = match (*base.add(cid)).as_mut() {
+        Some(c) => c,
+        None => return -3,
+    };
+    let mut m = ipc::Message { cap, len: buf.len() as u16, data: [0; ipc::MSG_PAYLOAD] };
+    unsafe {
+        let dst = m.data.as_mut_ptr();
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len());
+    }
+    match ch.send(&m) {
+        Ok(()) => {
+            chan_wake(cid);
+            0
+        }
         Err(_) => -1,
     }
 }
 
 #[no_mangle]
 pub extern "C" fn rust_ipc_recv(buf: *mut u8, len_out: *mut u64, cap_out: *mut u32) -> i32 {
-    let ch = match unsafe { (&mut *core::ptr::addr_of_mut!(CHAN)).as_mut() } {
+    unsafe { rust_ipc_recv_ch(0, buf, len_out, cap_out) }
+}
+
+#[no_mangle]
+pub extern "C" fn rust_ipc_recv_ch(cid: usize, buf: *mut u8, len_out: *mut u64, cap_out: *mut u32) -> i32 {
+    if cid >= NCHAN {
+        return -3;
+    }
+    let base = unsafe { core::ptr::addr_of_mut!(CHAN) as *mut Option<ipc::Channel> };
+    let ch = match unsafe { (*base.add(cid)).as_mut() } {
         Some(c) => c,
         None => return -3,
     };
@@ -553,6 +623,10 @@ static mut CNT_B: u32 = 0;
 pub static mut PAYLOAD_TOKEN: u32 = 1; // rust_tasks_init 里发真值
 pub static mut PAYLOAD_EP: u32 = 1;    // 端点能力: IPC 通道的钥匙
 pub static mut PAYLOAD2_TOKEN: u32 = 1; // 第二个用户任务的画屏钥匙
+pub static mut PAYLOAD3_TOKEN: u32 = 1; // 翻译器服务的过门钥匙
+pub static mut PAYLOAD4_TOKEN: u32 = 1; // VFS 客户端的画屏钥匙
+pub static mut PAYLOAD_EP_Q: u32 = 1;  // 通道1 (翻译器请求) 端点
+pub static mut PAYLOAD_EP_R: u32 = 1;  // 通道2 (翻译器应答) 端点
 
 extern "C" {
     fn fb_putchar(cx: i32, cy: i32, c: u8, color: u32);
@@ -722,37 +796,33 @@ pub extern "C" fn rust_syscall_entry(frame: *mut syscall::SyscallFrame) -> u64 {
             return 0;
         }
         if f.rax == 4 {
+            // 发送按令牌路由到对应通道, 成功后 rust_ipc_send 内部唤醒该通道的等待者
             f.rax = if ep_cap_check(f.rdi as u32) {
                 let len = if f.rdx > 48 { 48 } else { f.rdx };
-                let r = rust_ipc_send(f.rdi as u32, f.rsi as *const u8, len);
-                if r == 0 {
-                    // 喂饱了等通道的线程就把他叫醒
-                    if CHAN_WAITER != usize::MAX {
-                        let s: *mut task::Scheduler = core::ptr::addr_of_mut!(SCHED);
-                        (*s).wake(CHAN_WAITER);
-                        CHAN_WAITER = usize::MAX;
-                    }
-                }
-                r as u64
+                rust_ipc_send(f.rdi as u32, f.rsi as *const u8, len) as u64
             } else {
                 u64::MAX
             };
             return 0;
         }
-        // 5 = IPC_RECV (试探版): 收到就拷给用户, 空了就阻塞自己
+        // 5 = IPC_RECV: 按令牌路由到对应通道, 收到就拷给用户, 空了就登记等待并阻塞
         if f.rax == 5 {
-            if !ep_cap_check(f.rdi as u32) {
-                f.rax = u64::MAX;
-                return 0;
-            }
-            let r = rust_ipc_recv(f.rsi as *mut u8, f.rdx as *mut u64, f.r8 as *mut u32);
+            let cid = match unsafe { ep_channel(f.rdi as u32) } {
+                Some((c, _)) => c,
+                None => {
+                    f.rax = u64::MAX;
+                    return 0;
+                }
+            };
+            let r = rust_ipc_recv_ch(cid, f.rsi as *mut u8, f.rdx as *mut u64, f.r8 as *mut u32);
             if r == 0 {
                 f.rax = 0;
                 return 0;
             }
-            // 通道空: 登记等待者, 阻塞, 切走
+            // 通道空: 登记该通道的等待者, 阻塞, 切走
             let s: *mut task::Scheduler = core::ptr::addr_of_mut!(SCHED);
-            CHAN_WAITER = (*s).cur_index();
+            let w = core::ptr::addr_of_mut!(CHAN_WAITER) as *mut usize;
+            *w.add(cid) = (*s).cur_index();
             (*s).block_cur();
             f.rax = 0;
             return rust_schedule(frame as u64);
@@ -870,7 +940,7 @@ extern "C" fn thread_beta() -> ! {
 static mut STACK_C: [u8; 16384] = [0; 16384];
 static mut IPC_COUNT: u32 = 0;
 static mut IPC_SCRATCH: [u8; 64] = [0; 64];
-static mut CHAN_WAITER: usize = usize::MAX; // 阻塞在通道上的线程
+static mut CHAN_WAITER: [usize; NCHAN] = [usize::MAX; NCHAN]; // 每通道一个阻塞等待者
 
 // fs 监视线程: 读 LOG 文件首字节上屏第 9 行, 爬升 = 用户写→内核存→内核读 全通
 static mut STACK_D: [u8; 16384] = [0; 16384];
@@ -906,7 +976,7 @@ extern "C" fn thread_ipc() -> ! {
             } else {
                 // 通道空: 阻塞自己, 载荷一发消息就被唤醒
                 let s: *mut task::Scheduler = core::ptr::addr_of_mut!(SCHED);
-                CHAN_WAITER = (*s).cur_index();
+                CHAN_WAITER[0] = (*s).cur_index();
                 (*s).block_cur();
             }
         }
@@ -931,6 +1001,19 @@ pub extern "C" fn rust_tasks_init() -> i32 {
         let p2 = rust_cap_grant(syscall::CAP_FRAMEBUF, 0); // 任务B 的画屏钥匙
         let t2: *mut u32 = core::ptr::addr_of_mut!(PAYLOAD2_TOKEN);
         *t2 = p2;
+        // VFS 翻译器两件套: 服务与客户端的过门钥匙 + 通道 1/2 端点
+        let p3 = rust_cap_grant(syscall::CAP_FRAMEBUF, 0);
+        let t3p: *mut u32 = core::ptr::addr_of_mut!(PAYLOAD3_TOKEN);
+        *t3p = p3;
+        let p4 = rust_cap_grant(syscall::CAP_FRAMEBUF, 0);
+        let t4p: *mut u32 = core::ptr::addr_of_mut!(PAYLOAD4_TOKEN);
+        *t4p = p4;
+        let eq = rust_cap_grant(capability::CAP_ENDPOINT, 1);
+        let eqp: *mut u32 = core::ptr::addr_of_mut!(PAYLOAD_EP_Q);
+        *eqp = eq;
+        let er = rust_cap_grant(capability::CAP_ENDPOINT, 2);
+        let erp: *mut u32 = core::ptr::addr_of_mut!(PAYLOAD_EP_R);
+        *erp = er;
         rust_ipc_channel_init();
         vmo_init(); // 共享内存池上线
         // 帧缓冲参数从 bootboot 抄 (fb_ptr@0x28, scanline/width/height)
@@ -988,12 +1071,18 @@ pub extern "C" fn rust_tasks_init() -> i32 {
         if c3.is_none() {
             return -3;
         }
+        // VFS 翻译器服务 + 客户端: ring3 经通道 1/2 做 OPEN/WRITE/READ 往返
+        let sv = (*s).spawn_user(userland3::srv_start as u64, userland3::stack_top());
+        let cl = (*s).spawn_user(userland4::cli_start as u64, userland4::stack_top());
+        if sv.is_none() || cl.is_none() {
+            return -5;
+        }
         if a.is_none() || b.is_none() || c.is_none() || d.is_none() || e5.is_none() || c2.is_none()
         {
             return -1;
         }
         // 每任务一条独立中断栈, 调度切换时写 TSS.RSP0 — ring3 帧不再互相踩
-        static mut IRQ_STACKS: [[u8; 4096]; 8] = [[0; 4096]; 8];
+        static mut IRQ_STACKS: [[u8; 4096]; 12] = [[0; 4096]; 12];
         for i in 0..(*s).n {
             let top = (core::ptr::addr_of_mut!(IRQ_STACKS) as u64) + ((i as u64) + 1) * 4096;
             (*s).set_irq_top(i, top);

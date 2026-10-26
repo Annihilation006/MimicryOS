@@ -1,0 +1,216 @@
+//! 第四个 Ring3 用户任务 —— VFS 翻译器客户端演示
+//! 全程走 IPC: OPEN "OUT" → WRITE "VFS!" → READ 回来 → 把回读内容画上屏。
+//! 回读字节等于写入字节 → 青色 "VFS 004 OK"; 不符 → 红色, 数字显示实际长度。
+//! 文件本体在 tmpfs, 令牌在翻译器手里 —— 客户端只见了 fd 和字节。
+
+use core::arch::asm;
+
+const SYS_GLYPH: u64 = 2;
+const SYS_IPC_SEND: u64 = 4;
+const SYS_IPC_RECV: u64 = 5;
+const SYS_FILL: u64 = 13;
+const SYS_YIELD: u64 = 12;
+
+// 令牌静态走 crate 路径 (extern "C" 引不到 Rust 命名修饰符号)
+fn token() -> u64 {
+    unsafe { core::ptr::read_volatile(&raw const crate::PAYLOAD4_TOKEN) as u64 }
+}
+fn ep_q() -> u64 {
+    unsafe { core::ptr::read_volatile(&raw const crate::PAYLOAD_EP_Q) as u64 }
+}
+fn ep_r() -> u64 {
+    unsafe { core::ptr::read_volatile(&raw const crate::PAYLOAD_EP_R) as u64 }
+}
+
+fn glyph(ch: u8, x: i64, y: i64, color: u32) -> i64 {
+    let ret: i64;
+    unsafe {
+        asm!(
+            "int 0x80",
+            in("rax") SYS_GLYPH, in("rdi") token(),
+            in("rsi") ch as u64, in("rdx") x, in("r8") y, in("r9") color as u64,
+            lateout("rax") ret,
+        );
+    }
+    ret
+}
+
+fn fill(x: i64, y: i64, w: i64, h: i64, color: u32) {
+    unsafe {
+        asm!(
+            "int 0x80",
+            in("rax") SYS_FILL, in("rdi") token(),
+            in("rsi") x, in("rdx") y, in("r8") w, in("r9") h, in("r10") color as u64,
+            lateout("rax") _,
+        );
+    }
+}
+
+fn ipc_send(tok: u64, buf: *const u8, len: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        asm!(
+            "int 0x80",
+            in("rax") SYS_IPC_SEND, in("rdi") tok, in("rsi") buf, in("rdx") len,
+            lateout("rax") ret,
+        );
+    }
+    ret
+}
+
+fn ipc_recv(tok: u64, buf: *mut u8, len_out: *mut u64, cap_out: *mut u32) -> u64 {
+    let ret: u64;
+    unsafe {
+        asm!(
+            "int 0x80",
+            in("rax") SYS_IPC_RECV, in("rdi") tok, in("rsi") buf,
+            in("rdx") len_out, in("r8") cap_out,
+            lateout("rax") ret,
+        );
+    }
+    ret
+}
+
+fn yield_now() {
+    unsafe {
+        asm!("int 0x80", in("rax") SYS_YIELD, in("rdi") token(), lateout("rax") _,);
+    }
+}
+
+static mut CLI_STACK: [u8; 16384] = [0; 16384];
+
+pub fn stack_top() -> u64 {
+    unsafe { (core::ptr::addr_of!(CLI_STACK) as u64) + 16384 }
+}
+
+static mut REQ: [u8; 44] = [0; 44];
+static mut RESP: [u8; 48] = [0; 48];
+static mut RBUF: [u8; 32] = [0; 32];
+
+use crate::translator::{self, FS_OP_OPEN, FS_OP_READ, FS_OP_WRITE};
+
+/// 走翻译器开文件, 返回 fd (-1 = 失败)
+fn vfs_open(name: &[u8]) -> i32 {
+    unsafe {
+        let req = core::ptr::addr_of_mut!(REQ) as *mut u8;
+        translator::build_request(
+            FS_OP_OPEN, 0, 0, 0, name,
+            &mut *(core::ptr::addr_of_mut!(REQ) as *mut [u8; translator::REQ_SIZE]),
+        );
+        let _ = ipc_send(ep_q(), req, translator::REQ_SIZE as u64);
+        let rb = core::ptr::addr_of_mut!(RESP) as *mut u8;
+        let mut mlen: u64 = 0;
+        let mut mcap: u32 = 0;
+        if ipc_recv(ep_r(), rb, core::ptr::addr_of_mut!(mlen), core::ptr::addr_of_mut!(mcap)) != 0 {
+            return -1;
+        }
+        translator::resp_status(core::slice::from_raw_parts(rb, translator::RESP_SIZE))
+    }
+}
+
+/// 走翻译器写文件
+fn vfs_write(fd: i32, payload: &[u8]) -> u32 {
+    unsafe {
+        translator::build_request_data(
+            FS_OP_WRITE, fd as u16, 0, payload.len() as u32, b"", payload,
+            &mut *(core::ptr::addr_of_mut!(REQ) as *mut [u8; translator::REQ_DATA_SIZE]),
+        );
+        let rb = core::ptr::addr_of_mut!(REQ) as *mut u8;
+        let _ = ipc_send(ep_q(), rb, translator::REQ_DATA_SIZE as u64);
+        let pb = core::ptr::addr_of_mut!(RESP) as *mut u8;
+        let mut mlen: u64 = 0;
+        let mut mcap: u32 = 0;
+        if ipc_recv(ep_r(), pb, core::ptr::addr_of_mut!(mlen), core::ptr::addr_of_mut!(mcap)) != 0 {
+            return u32::MAX;
+        }
+        translator::resp_len(core::slice::from_raw_parts(pb, translator::RESP_SIZE))
+    }
+}
+
+/// 走翻译器读文件, 字节落 RBUF, 返回长度
+fn vfs_read(fd: i32) -> u32 {
+    unsafe {
+        translator::build_request(
+            FS_OP_READ, fd as u16, 0, 32, b"",
+            &mut *(core::ptr::addr_of_mut!(REQ) as *mut [u8; translator::REQ_SIZE]),
+        );
+        let rb = core::ptr::addr_of_mut!(REQ) as *mut u8;
+        let _ = ipc_send(ep_q(), rb, translator::REQ_SIZE as u64);
+        let pb = core::ptr::addr_of_mut!(RESP) as *mut u8;
+        let mut mlen: u64 = 0;
+        let mut mcap: u32 = 0;
+        if ipc_recv(ep_r(), pb, core::ptr::addr_of_mut!(mlen), core::ptr::addr_of_mut!(mcap)) != 0 {
+            return u32::MAX;
+        }
+        let resp = core::slice::from_raw_parts(pb, translator::RESP_SIZE);
+        let n = translator::resp_len(resp) as usize;
+        let dst = core::ptr::addr_of_mut!(RBUF) as *mut u8;
+        let mut k = 0usize;
+        let take = if n < 32 { n } else { 32 };
+        while k < take {
+            *dst.add(k) = translator::resp_data(resp, k);
+            k += 1;
+        }
+        n as u32
+    }
+}
+
+const CYAN: u32 = 0x00FFFF;
+const RED: u32 = 0x0000FF;
+const BLACK: u32 = 0x000000;
+
+// 显示区: 行 12 (y=204), 先擦后画
+const DX: i64 = 24;
+const DY: i64 = 202;
+const DW: i64 = 130;
+const DH: i64 = 20;
+
+#[no_mangle]
+pub extern "C" fn cli_start() -> ! {
+    loop {
+        unsafe {
+            let fd = vfs_open(b"OUT");
+            if fd >= 0 {
+                let w = vfs_write(fd, b"VFS!");
+                let n = vfs_read(fd);
+                // 回读校验: "VFS!" 四字节原样回来 = 翻译器全链路通
+                let rb = core::ptr::addr_of!(RBUF) as *const u8;
+                let ok = w == 4
+                    && n == 4
+                    && *rb == b'V'
+                    && *rb.add(1) == b'F'
+                    && *rb.add(2) == b'S'
+                    && *rb.add(3) == b'!';
+                let color = if ok { CYAN } else { RED };
+                fill(DX, DY, DW, DH, BLACK);
+                glyph(b'V', DX + 3, DY + 2, color);
+                glyph(b'F', DX + 15, DY + 2, color);
+                glyph(b'S', DX + 27, DY + 2, color);
+                glyph(b' ', DX + 39, DY + 2, color);
+                let v = if ok { 4 } else { n.min(999) };
+                glyph(b'0' + ((v / 100) % 10) as u8, DX + 51, DY + 2, color);
+                glyph(b'0' + ((v / 10) % 10) as u8, DX + 63, DY + 2, color);
+                glyph(b'0' + (v % 10) as u8, DX + 75, DY + 2, color);
+                glyph(b' ', DX + 87, DY + 2, color);
+                if ok {
+                    glyph(b'O', DX + 99, DY + 2, color);
+                    glyph(b'K', DX + 111, DY + 2, color);
+                } else {
+                    glyph(b'N', DX + 99, DY + 2, color);
+                    glyph(b'3', DX + 111, DY + 2, color);
+                }
+            } else {
+                fill(DX, DY, DW, DH, BLACK);
+                glyph(b'N', DX + 3, DY + 2, RED);
+                glyph(b'F', DX + 15, DY + 2, RED);
+                glyph(b'S', DX + 27, DY + 2, RED);
+            }
+        }
+        let mut spin = 2_000_000i64;
+        while spin > 0 {
+            core::hint::spin_loop();
+            spin -= 1;
+        }
+        yield_now();
+    }
+}

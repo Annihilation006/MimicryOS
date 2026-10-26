@@ -37,8 +37,20 @@
 | vma | 无 | .bss 节点池 ×256 | 栈上池，7 项 |
 | pagetable | frame::FrameSource | 当前 CR3（asm_read_cr3） | Arena，6 项 |
 | elf | 无 | 静态 ELF64 解析与加载 | 内存缓冲区，2 项 |
-| translator | 无 | 用户态 VFS 翻译器 RPC 框架 | 模拟请求，1 项 |
-| 集成 | frame+pagetable+vma | — | test_root.rs，2 项 |
+| elfprog | elf | 内嵌 ELF 用户镜像构建 | 内存缓冲区，2 项 |
+| translator | 无 | 用户态 VFS 翻译器纯逻辑核 serve(FsBack) | MemFs 替身，4 项 |
+| 集成 | frame+pagetable+vma | — | test_root.rs，3 项 |
+
+**Ring3 任务表**（调度器容量 12，现用 10）：
+0 kernel_main · 1-4 内核线程 · 5 userland · 6 userland2(VMO读数)
+· 7 ELF 任务（tmpfs 装载）· 8 userland3(VFS 翻译器服务) · 9 userland4(VFS 客户端)
+
+**IPC 通道表**（NCHAN=3）：0 任务A→ipc服务 · 1 翻译器请求 · 2 翻译器应答。
+recv 系统调用按端点令牌路由；空通道登记每通道等待者后阻塞。
+
+**系统调用号**：1 画点/write · 2 字形 · 4 IPC_SEND · 5 IPC_RECV · 6 OPEN
+· 7 WRF · 8 RDF · 9 VMO_CREATE · 10 VMO_GETADDR · 12 YIELD · 13 FILL
+· 60 EXIT。0 read（兼容桩）。
 
 **FrameSource** 是 Rust 侧的供给接口：`alloc_frame/free_frame/frame_to_virt`。
 内核实现依赖 BOOTBOOT 的低地址身份映射（phys == virt）；一旦内核建立

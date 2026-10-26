@@ -16,7 +16,7 @@ pub struct Task {
 }
 
 pub struct Scheduler {
-    pub t: [Task; 8],
+    pub t: [Task; 12],
     pub n: usize,   // 已占槽（密集分配, 不回收）
     pub cur: usize, // 当前运行槽
 }
@@ -24,7 +24,7 @@ pub struct Scheduler {
 impl Scheduler {
     pub const fn new() -> Self {
         Scheduler {
-            t: [Task { rsp: 0, live: false, irq_top: 0 }; 8],
+            t: [Task { rsp: 0, live: false, irq_top: 0 }; 12],
             n: 0,
             cur: 0,
         }
@@ -33,7 +33,7 @@ impl Scheduler {
     // 把正在跑的上下文（kernel_main/shell）收编为任务 0:
     // rsp=0 表示还没被打断过, 第一次 tick 自然把真现场存进来
     pub unsafe fn adopt_current(&mut self) -> usize {
-        if self.n >= 8 {
+        if self.n >= 12 {
             return usize::MAX;
         }
         let t = core::ptr::addr_of_mut!(self.t) as *mut Task;
@@ -121,7 +121,7 @@ impl Scheduler {
         cs: u64,
         ss: u64,
     ) -> Option<usize> {
-        if self.n >= 8 {
+        if self.n >= 12 {
             return None;
         }
         let frame = stack_top - (FRAME_SLOTS * 8) as u64;
@@ -200,7 +200,7 @@ mod tests {
     fn t4_slots_cap() {
         let mut stacks = Vec::new();
         let mut s = Scheduler::new();
-        for _ in 0..8 {
+        for _ in 0..12 {
             let (v, top) = mkstack();
             stacks.push(v);
             assert!(unsafe { s.spawn(0x1000, top) }.is_some());
