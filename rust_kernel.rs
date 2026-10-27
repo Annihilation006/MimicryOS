@@ -1304,6 +1304,18 @@ pub extern "C" fn rust_tasks_init() -> i32 {
         if FS.write(hh, 0, core::slice::from_raw_parts(hp, hn)) != hn {
             return -4;
         }
+        // 参数版演示程序: 入口读栈页底部参数块 write(fd2, argv, len) 后退出,
+        // shell `run argv <词>` 即可端到端验证参数链路
+        static mut ARGV_IMG: [u8; 256] = [0; 256];
+        let vp = core::ptr::addr_of_mut!(ARGV_IMG) as *mut u8;
+        let vn = elfprog::build_image_arg(core::slice::from_raw_parts_mut(vp, 256), 0x0040_0000);
+        let vh = match FS.open(b"argv") {
+            Some(h) => h,
+            None => return -4,
+        };
+        if FS.write(vh, 0, core::slice::from_raw_parts(vp, vn)) != vn {
+            return -4;
+        }
         // 2) 从文件读回, 解析并装载
         let bin_len = FS.read(fh, 0, core::slice::from_raw_parts_mut(img, 512));
         let elf_entry = elfprog::load(core::slice::from_raw_parts(img, bin_len), |va, bytes, _| {
