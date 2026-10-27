@@ -65,8 +65,12 @@ frame_to_virt 与 spawn/BRK 的段拷贝走该窗口。rust_vm_bootstrap（切 C
 （SPAWN 装载 / BRK 堆 / 直映射表帧），避免分配帧与窗口内容撞车。
 
 **FrameSource** 是 Rust 侧的供给接口：`alloc_frame/free_frame/frame_to_virt`。
-内核实现依赖 BOOTBOOT 的低地址身份映射（phys == virt）；一旦内核建立
-自己的直映射区，只需改 `FrameSource for FrameAllocator` 一处。
+内核实现依赖 BOOTBOOT 的低地址身份映射（phys == virt）；内核已铺自己的
+直映射区（rust_direct_map_init），`FrameSource for FrameAllocator` 按
+DIRECT 标志自动切换。
+
+**装载窗口表（WINTAB）**：spawn 的段+栈窗口按任务槽分配，SYS_EXIT 时
+归还——死槽回收与窗口回收同步闭环，长期运行无泄漏。
 
 ## 3. C ↔ Rust 接口清单（extern "C"，C 侧直接声明即用）
 
@@ -87,7 +91,18 @@ u64   rust_cpu_report()               返回 CR0（顺带打印厂商串）
 页表 flags 位（传给 rust_map_page）：WRITABLE=1<<1，USER=1<<2，
 NO_EXEC=1<<63（PRESENT 自动置位）。
 
-## 4. 质量基建
+## 4. 调度与键盘（现状事实）
+
+- **优先级**：Task.prio 数小者优先；schedule 严格更高独占 CPU，同级
+  轮转。当前全部默认 1（内核线程仍是自旋体，提级会饿死用户任务——
+  线程改 sleep 后再接线）
+- **键盘**：kbdrv.asm（纯汇编 IRQ1 驱动）＝33 号门 + 扫描码翻译 +
+  双环形队列（A=shell 阻塞 getc，B=SYS_READ 非阻塞 take）。初始化
+  时先排干 8042 输出缓冲再改配置字节（bit0 中断使能）——不排干会把
+  BIOS 残留的 ACK 当配置读，中断永远不触发。自证静态
+  kb_cfg_read/kb_cfg_write 可 gdb 查看
+
+## 5. 质量基建
 
 - **单测**：每个模块内嵌 `#[cfg(test)]`；`rustc --test tools/test_root.rs`
   一把全跑（宿主执行，不需要真机）
@@ -96,13 +111,12 @@ NO_EXEC=1<<63（PRESENT 自动置位）。
 - **启动配方**：mkbootimg 需要 `boot/kernel.elf` + `boot/sys/config`
   （`kernel=kernel.elf`），ci.sh 已内置
 
-## 5. 路线（按 02-memory.md 之后的顺序）
+## 6. 路线（2024 修订：中断/调度/系统调用已由 test 分支实现）
 
 1. ✅ 物理帧位图分配器（保守放开策略）
 2. ✅ 小对象池 / VMA 簿记 / 四级页表操作
-3. ⬜ 页表自举：建立内核直映射区，替换身份映射假设
-4. ⬜ 缺页处理路径（需与 main 作者的中断设施衔接）
+3. ✅ 直映射区（原位铺窗口版）；⬜ 每进程页表（vmboot 切 CR3 版
+   三重故障待查——已知线索：分配器可能发到 BOOTBOOT 自身页表所在帧）
+4. ⬜ 缺页处理路径
 5. ⬜ fork 的深拷贝 + COW 引用计数
-6. ⬜ 用户态地址空间模板（Ring 3 就绪后）
-
-中断/调度/系统调用不在此路线内——那是 main 作者的领地（求同存异）。
+6. ✅ 用户态地址空间模板（aspace::new_user，待 CR3 切换解锁）
