@@ -19,9 +19,8 @@ typedef short int16_t;
 
 #include "bootboot.h"
 
-/* [test] shell 按键副本 → 用户态输入队列 (rust 侧 rust_kb_feed) */
-extern void rust_kb_feed(unsigned char c);
-/* [test] 直映射: 在现行页表空闲槽铺 1GB 大页窗口, 不切 CR3 */
+extern void kbdrv_init(void);        /* [test] 装 33 号门 + 放行 IRQ1 */
+extern char kbdrv_getc(void);   /* [test] IRQ1 汇编键盘驱动: 阻塞取字符 */
 extern int rust_direct_map_init(unsigned long long max_phys);
 /* [test] run 命令: tmpfs ELF → 新任务 */
 extern unsigned long long rust_spawn_file(unsigned char *name, unsigned char *arg, unsigned long long arglen); /* [test] run 命令 */
@@ -658,8 +657,7 @@ void shell(void) {
             fb_putpixel(cursor_x * 9 + i, cursor_y * 17 + 16, 0xFFFFFF);
         }
         
-        char c = keyboard_read();
-        rust_kb_feed((unsigned char)c); /* [test] 副本喂给用户态输入队列, shell 行为不变 */
+        char c = kbdrv_getc(); /* [test] IRQ1 汇编驱动统一供键, 阻塞语义同前 */
         
         for (int i = 0; i < 8; i++) {
             fb_putpixel(cursor_x * 9 + i, cursor_y * 17 + 15, 0x000000);
@@ -714,7 +712,7 @@ void shell(void) {
                 user_prompt();
             } else if (cmd[0] == 'd' && cmd[1] == 'e' && cmd[2] == 's' && cmd[3] == 'k' && cmd[4] == 't' && cmd[5] == 'o' && cmd[6] == 'p' && cmd[7] == '\0') {
                 desktop_draw();
-                keyboard_read();
+                kbdrv_getc();
                 fb_fill(0x000000);
                 cursor_x = 0;
                 cursor_y = 0;
@@ -924,6 +922,7 @@ void kernel_main(void) {
     extern void usermode_init(void);
     usermode_init();            /* [test] GDT/TSS/int0x80 全 asm */
     rust_direct_map_init(0x40000000ULL); /* [test] 直映射上线 (1GB), 不切 CR3 */
+    kbdrv_init();                        /* [test] IRQ1 汇编键盘驱动上线 */
     register_interrupt_handler(32, pit_tick);
     pic_clear_mask(0);          /* IRQ0 计时器 */
     outb(0x43, 0x36);           /* 通道0 方波 */

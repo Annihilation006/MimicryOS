@@ -838,50 +838,15 @@ unsafe fn spawn_elf_image(bin: &[u8], arg: &[u8]) -> u64 {
     }
 }
 
-// ---- 键盘输入队列: shell 的 keyboard_read 钩子喂入, SYS_READ 取走 ----
-// shell 是键盘的唯一读者(别动他的活), 我们只拿副本; 可打印字符 + 换行入队
-static mut KB_BUF: [u8; 32] = [0; 32];
-static mut KB_HEAD: usize = 0; // 写位
-static mut KB_TAIL: usize = 0; // 读位
-static mut KB_WAITER: usize = usize::MAX; // 阻塞在 read 上的任务
+// ---- 键盘输入: kbdrv.asm 的 IRQ1 驱动负责收码入队 ----
+// SYS_READ 经 kbdrv_take 直接从汇编环形缓冲取字节
 
-/// shell 每收到一个字符喂一份副本; 小写转大写 (字库只有大写), 只收可打印 ASCII 和换行
-#[no_mangle]
-pub extern "C" fn rust_kb_feed(c: u8) {
-    let up = if c >= b'a' && c <= b'z' { c - 32 } else { c };
-    let printable = up >= 0x20 && up < 0x7F;
-    if !printable && up != b'\n' {
-        return;
-    }
-    unsafe {
-        let head = KB_HEAD;
-        let next = (head + 1) % 32;
-        if next == KB_TAIL {
-            return; // 满: 丢新字节, 键盘流丢一个字符无害
-        }
-        *(core::ptr::addr_of_mut!(KB_BUF) as *mut u8).add(head) = up;
-        KB_HEAD = next;
-        if KB_WAITER != usize::MAX {
-            let s: *mut task::Scheduler = core::ptr::addr_of_mut!(SCHED);
-            (*s).wake(KB_WAITER);
-            KB_WAITER = usize::MAX;
-        }
-    }
-}
-
-/// 从队列取最多 len 字节, 返回实际取数
+/// SYS_READ: 从 kbdrv 汇编队列取最多 len 字节 (非阻塞)
 unsafe fn kb_take(dst: *mut u8, len: usize) -> usize {
-    let mut k = 0usize;
-    while k < len {
-        if KB_TAIL == KB_HEAD {
-            break;
-        }
-        let b = *(core::ptr::addr_of!(KB_BUF) as *const u8).add(KB_TAIL);
-        *dst.add(k) = b;
-        KB_TAIL = (KB_TAIL + 1) % 32;
-        k += 1;
+    extern "C" {
+        fn kbdrv_take(buf: *mut u8, maxlen: u64) -> u64;
     }
-    k
+    kbdrv_take(dst, len as u64) as usize
 }
 
 #[allow(dead_code)]
@@ -967,20 +932,12 @@ pub extern "C" fn rust_syscall_entry(frame: *mut syscall::SyscallFrame) -> u64 {
             f.rax = 0;
             return rust_schedule(frame as u64);
         }
-        // 0 = SYS_READ (Linux ABI): rdi=fd rsi=buf rdx=len, 只接键盘队列 (fd 0)
-        // 队列空: 登记等待者阻塞切走, 唤醒后回用户态 rax=0, 由调用方重试
+        // 0 = SYS_READ (Linux ABI): rdi=fd rsi=buf rdx=len, 从 kbdrv 汇编队列取
+        // 非阻塞: 空则返回 0, 由调用方让出后重试 (汇编中断侧无唤醒钩子)
         if f.rax == 0 {
             let len = if f.rdx > 64 { 64 } else { f.rdx } as usize;
             let dst = f.rsi as *mut u8;
-            let got = kb_take(dst, len);
-            if got == 0 {
-                let s: *mut task::Scheduler = core::ptr::addr_of_mut!(SCHED);
-                KB_WAITER = (*s).cur_index();
-                (*s).block_cur();
-                f.rax = 0;
-                return rust_schedule(frame as u64);
-            }
-            f.rax = got as u64;
+            f.rax = kb_take(dst, len) as u64;
             return 0;
         }
         // 1 = SYS_WRITE 的 Linux 兼容形态: fd 1 → 行11, fd 2 → 行14 (不走能力门)

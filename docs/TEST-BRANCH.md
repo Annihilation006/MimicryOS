@@ -34,10 +34,12 @@ run <file> [arg]    把 tmpfs 里的 ELF 文件装载为新任务, 打印槽号
 ## 架构（test 分支新增，全部 no_std Rust）
 
 ```
-kernel.c (你的) ──4 个钩子──┬─ rust_kb_feed         按键副本入队
-                            ├─ rust_tick_hook       每 tick 睡眠唤醒
+kernel.c (你的) ──3 个钩子──┬─ rust_tick_hook       每 tick 睡眠唤醒
                             ├─ rust_direct_map_init 直映射窗口
                             └─ rust_tasks_init      启动整个 Rust 侧
+
+kbdrv.asm = IRQ1 中断驱动键盘 (纯汇编: 33号门 + 扫描码翻译 + 双环形
+队列), shell 与 SYS_READ 各占一条队列; 早期 rust_kb_feed 副本机制已由它取代
 
 rust_kernel.rs = 调度(12槽/优先级/睡眠/死槽回收) + 16 个系统调用分发
 frame/kmem/vma/pagetable = 内存全套
@@ -68,7 +70,8 @@ rustc --edition 2021 --test tools/test_root.rs -o /tmp/t && /tmp/t
 ## 已知边界 / 下一步
 
 - argv 参数：内核侧管道已验证，用户态读参待调（hello 暂用固定消息）
-- 能力槽 / spawn 窗口的长期回收策略在路线图上
+- 能力槽无回收：`run` 反复执行会耗尽 CSpace 槽位，需加 revoke
+- 装载窗口已随任务槽回收（WINTAB 闭环），内存侧长期运行无泄漏
 - 每进程独立地址空间（CR3 切换）封存于 rust_vm_bootstrap，待查三重故障
 - 翻译器后端目前是内核 tmpfs；接你的 fat12 磁盘是自然的下一步
 
