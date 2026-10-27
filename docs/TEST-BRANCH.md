@@ -87,6 +87,10 @@ rustc --edition 2021 --test tools/test_root.rs -o /tmp/t && /tmp/t
   调用上下文与窗口号，SPAWN_DBG 故障码待读，gdb 工具链已备好）。
   排查提示：怀疑与直映射写窗口或 2MB 叶放行的某处布局撞车，与
   rust_vm_bootstrap 三重故障可能同根。
+  **最新证据**：sendkey 投递按启动随机失效（同脚本一次 h2=15 全到、
+  一次 h2=0 全丢）——8042 配置写回未稳定生效。下步：按启动读
+  kb_cfg_read 回对比，定位配置写入被吞的条件。shell 收不到键时
+  run 自然不执行，此前"挂起"结论作废，改为"按键未送达"。
 - 能力槽无回收：`run` 反复执行会耗尽 CSpace 槽位，需加 revoke
 - 装载窗口已随任务槽回收（WINTAB 闭环），内存侧长期运行无泄漏
 - 每进程独立地址空间（CR3 切换）封存于 rust_vm_bootstrap，待查三重故障
