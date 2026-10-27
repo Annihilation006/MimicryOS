@@ -81,11 +81,17 @@ rustc --edition 2021 --test tools/test_root.rs -o /tmp/t && /tmp/t
 
 ## 已知边界 / 下一步
 
-- argv 参数：内核侧管道已验证，用户态读参待调（hello 暂用固定消息）
+- argv 参数：内核侧管道已逐字节验证（参数块 len/ptr/串全对），参数版
+  镜像已在 tmpfs（`argv` 文件）。**未解**：shell `run argv` 触发的
+  第二次 spawn 会挂起内核（客户端自动 spawn 同一函数却正常——差异在
+  调用上下文与窗口号，SPAWN_DBG 故障码待读，gdb 工具链已备好）。
+  排查提示：怀疑与直映射写窗口或 2MB 叶放行的某处布局撞车，与
+  rust_vm_bootstrap 三重故障可能同根。
 - 能力槽无回收：`run` 反复执行会耗尽 CSpace 槽位，需加 revoke
 - 装载窗口已随任务槽回收（WINTAB 闭环），内存侧长期运行无泄漏
 - 每进程独立地址空间（CR3 切换）封存于 rust_vm_bootstrap，待查三重故障
 - 翻译器后端目前是内核 tmpfs；接你的 fat12 磁盘是自然的下一步
+- 语言策略：新增代码一律 Rust（no_std）
 
 ## 合流建议
 
