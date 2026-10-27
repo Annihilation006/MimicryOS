@@ -65,6 +65,26 @@ impl Scheduler {
         }
     }
 
+    // 预测下一次 spawn 会落到哪个槽 (死槽优先, 否则新槽)
+    // spawn 窗口/参数块按槽号编址, 装载方需在 spawn 前知道槽号
+    pub fn peek_slot(&self) -> Option<usize> {
+        let t = core::ptr::addr_of!(self.t) as *const Task;
+        let mut i = 0usize;
+        unsafe {
+            while i < self.n {
+                if (*t.add(i)).dead {
+                    return Some(i);
+                }
+                i += 1;
+            }
+        }
+        if self.n < 12 {
+            Some(self.n)
+        } else {
+            None
+        }
+    }
+
     // 调优先级: 数小者优先
     pub unsafe fn set_prio(&mut self, idx: usize, prio: u8) {
         if idx < self.n {

@@ -732,9 +732,11 @@ static mut FS: tmpfs::TmpFs = tmpfs::TmpFs::new();
 // SYS_SPAWN 的装载窗口: 每个动态进程 2 页 (段 + 栈), 基址递增
 // BOOTBOOT 把 RAM 恒等映射成 2MB 大页, 4K map_page 插不进去 ——
 // 与现有用户区同款打法: 恒等物理页上 patch_user_region 放行, 直映射拷段
-static mut SPAWN_SEQ: u64 = 0;
-pub static mut SPAWN_DBG: u32 = 0; // 故障码: 6=解析 7=拷贝 8=槽满 0xFF=成功
+static mut SPAWN_DBG: u32 = 0; // 故障码: 6=解析 7=拷贝 8=槽满 0xFF=成功
 const SPAWN_VBASE: u64 = 0x0060_0000; // 6MB, 在帧分配器保留线以上
+// 装载窗口表: 窗口随任务槽绑定, 任务退出即回收复用 (NW 个 = 调度器容量)
+const NW: usize = 12;
+static mut WINTAB: [usize; NW] = [usize::MAX; NW]; // 窗口 → 任务槽, MAX = 空闲
 
 // 用户态 bump 堆: 16MB 起 4MB 上限, SYS_BRK 按需切清零块
 static mut USER_BRK: u64 = 0x0100_0000;
@@ -745,9 +747,22 @@ const USER_BRK_END: u64 = 0x0140_0000;
 unsafe fn spawn_elf_image(bin: &[u8], arg: &[u8]) -> u64 {
     let dbg = core::ptr::addr_of_mut!(SPAWN_DBG);
     *dbg = 0;
-    let seq = SPAWN_SEQ;
-    SPAWN_SEQ += 1;
-    let base = SPAWN_VBASE + seq * 0x2000;
+    // 领一个空闲装载窗口 (与任务槽绑定, 退出时归还)
+    let mut w = NW;
+    let wt = core::ptr::addr_of_mut!(WINTAB) as *mut usize;
+    let mut k = 0usize;
+    while k < NW {
+        if *wt.add(k) == usize::MAX {
+            w = k;
+            break;
+        }
+        k += 1;
+    }
+    if w == NW {
+        *dbg = 9; // 窗口耗尽
+        return u64::MAX;
+    }
+    let base = SPAWN_VBASE + (w as u64) * 0x2000;
     // 两页放行为用户可写可执行
     patch_user_region(base);
     patch_user_region(base + 0x1000);
@@ -811,7 +826,11 @@ unsafe fn spawn_elf_image(bin: &[u8], arg: &[u8]) -> u64 {
     let entry = entry0 - img_vaddr + base;
     let s: *mut task::Scheduler = core::ptr::addr_of_mut!(SCHED);
     match (*s).spawn_user(entry, base + 0x2000) {
-        Some(i) => i as u64,
+        Some(i) => {
+            // 窗口与任务槽绑定, 退出时按槽归还
+            *wt.add(w) = i;
+            i as u64
+        }
         None => {
             *dbg = 8;
             u64::MAX
@@ -933,7 +952,18 @@ pub extern "C" fn rust_syscall_entry(frame: *mut syscall::SyscallFrame) -> u64 {
         // 60 = SYS_EXIT: 当前任务不再可调度, 切走
         if f.rax == 60 {
             let s: *mut task::Scheduler = core::ptr::addr_of_mut!(SCHED);
+            let me = (*s).cur_index();
             (*s).exit_cur();
+            // 归还装载窗口: 任务退出, 它占的窗口下个 spawn 可复用
+            let wt = core::ptr::addr_of_mut!(WINTAB) as *mut usize;
+            let mut k = 0usize;
+            while k < NW {
+                if *wt.add(k) == me {
+                    *wt.add(k) = usize::MAX;
+                    break;
+                }
+                k += 1;
+            }
             f.rax = 0;
             return rust_schedule(frame as u64);
         }
