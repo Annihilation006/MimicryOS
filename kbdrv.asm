@@ -34,6 +34,10 @@ kb_tail2: resd 1
 kb_shift: resd 1           ; shift 按下态
 kb_caps:  resd 1           ; capslock 态
 kb_e0:    resd 1           ; 扩展前缀态
+global kb_cfg_read
+global kb_cfg_write
+kb_cfg_read:  resd 1       ; 自证: init 读到的 8042 配置字节
+kb_cfg_write: resd 1       ; 自证: init 写回的 8042 配置字节
 
 section .text
 
@@ -53,29 +57,51 @@ kbdrv_init:
     and al, 0xFD
     out 0x21, al
 
-    ; 8042 控制器配置字节: 置 bit0 (第一口中断使能 = IRQ1) —— 朋友的内核
-    ; 靠轮询, 这位从没开过; 不开它 8042 永远不拉 IRQ1, 门和掩码都对也没用
-    mov al, 0x20            ; 读配置字节命令
+    ; 8042 控制器配置字节: 置 bit0 (第一口中断使能 = IRQ1)。
+    ; 前置排干: 输出缓冲里可能压着 BIOS/BOOTBOOT 时代的键盘应答 (0xFA),
+    ; 不排干会把 ACK 当配置读, 真配置永远没被改
+.drain:
+    in al, 0x64
+    test al, 1
+    jz .drained
+    in al, 0x60
+    jmp .drain
+.drained:
+    mov al, 0x20           ; 读配置字节命令
     out 0x64, al
 .waitr:
     in al, 0x64
     test al, 1
-    jz .waitr               ; 等输出缓冲满
-    in al, 0x60             ; al = 配置字节
-    or al, 0x01             ; bit0 = 键盘中断使能
+    jz .waitr              ; 等输出缓冲满
+    in al, 0x60            ; al = 配置字节
+    movzx eax, al
+    mov [rel kb_cfg_read], eax
+    or al, 0x01            ; bit0 = 键盘中断使能
     mov bl, al
+    movzx eax, al
+    mov [rel kb_cfg_write], eax
 .ibf1:
     in al, 0x64
     test al, 2
-    jnz .ibf1               ; 等输入缓冲空
-    mov al, 0x60            ; 写配置字节命令
+    jnz .ibf1              ; 等输入缓冲空
+    mov al, 0x60           ; 写配置字节命令
     out 0x64, al
 .ibf2:
     in al, 0x64
     test al, 2
     jnz .ibf2
     mov al, bl
-    out 0x60, al            ; 新配置: 键盘中断开
+    out 0x60, al           ; 新配置: 键盘中断开
+    ; 回读验证: 真配置应当已是 0xFB
+    mov al, 0x20
+    out 0x64, al
+.waitr2:
+    in al, 0x64
+    test al, 1
+    jz .waitr2
+    in al, 0x60
+    movzx eax, al
+    mov [rel kb_cfg_read], eax
 
     xor eax, eax
     mov [rel kb_head], eax
