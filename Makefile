@@ -32,7 +32,7 @@ ASM = nasm
 ASMFLAGS = -f elf64
 OBJCOPY = objcopy
 
-OBJS = kernel.o filesystem.mod.o mouse.mod.o desktop.mod.o png.mod.o font.o cpu.o idt.o interrupt.o pic.o console.o isr.o usermode.o vmo.o kbdrv.o capacct.o
+OBJS = kernel.o filesystem.mod.o mouse.mod.o desktop.mod.o png.mod.o font.o cpu.o idt.o interrupt.o pic.o console.o isr.o usermode.o vmo.o kbdrv.o capacct.o sysinfo.o spinlock.o
 
 all: kernel.elf
 
@@ -92,3 +92,9 @@ kbdrv.o: kbdrv.asm
 
 capacct.o: capacct.c capacct.h
 	$(CC) $(CFLAGS) -c capacct.c -o capacct.o
+
+sysinfo.o: sysinfo.asm
+	$(ASM) $(ASMFLAGS) sysinfo.asm -o sysinfo.o
+
+spinlock.o: spinlock.asm
+	$(ASM) $(ASMFLAGS) spinlock.asm -o spinlock.o

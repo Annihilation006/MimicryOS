@@ -24,6 +24,9 @@ extern char kbdrv_getc(void);   /* [test] IRQ1 汇编键盘驱动: 阻塞取字�
 extern int rust_direct_map_init(unsigned long long max_phys);
 /* [test] run 命令: tmpfs ELF → 新任务 */
 extern unsigned long long rust_spawn_file(unsigned char *name, unsigned char *arg, unsigned long long arglen); /* [test] run 命令 */
+extern void asm_sysinfo_collect(unsigned char *out);   /* [test] 纯汇编 CPU 信息收集 */
+extern unsigned int asm_spin_trylock(unsigned long long *lock); /* [test] 纯汇编原子锁 */
+extern void asm_spin_unlock(unsigned long long *lock);
 #include "idt.h"
 #include "pic.h"
 #include "console.h"
@@ -930,6 +933,29 @@ void kernel_main(void) {
     outb(0x40, 11932 >> 8);
     rust_tasks_init();          /* [test] 两个 Rust 内核线程进就绪队列 */
     enable_interrupts();
+
+    /* [test] 纯汇编自证: sysinfo.asm 收集 CPU 信息上屏, spinlock.asm 原语自检 */
+    {
+        static unsigned char sinfo[96];
+        static char ven[13];
+        static volatile unsigned long long lck;
+        int si;
+        asm_sysinfo_collect(sinfo);
+        for (si = 0; si < 12; si++) ven[si] = ((char *)sinfo)[si];
+        ven[12] = '\0';
+        fb_print("CPU: ");
+        fb_print(ven);
+        fb_print("\n");
+        fb_print((char *)(sinfo + 0x0C)); /* 型号串自带 NUL 结尾 */
+        fb_print("\n");
+        if (asm_spin_trylock(&lck) && !asm_spin_trylock(&lck)) {
+            asm_spin_unlock(&lck);
+            fb_print(asm_spin_trylock(&lck) ? "spinlock OK\n" : "spinlock BAD\n");
+        } else {
+            fb_print("spinlock BAD\n");
+        }
+        asm_spin_unlock(&lck);
+    }
 
     fb_print("MimicryOS Shell\n");
     fb_print("Type help for commands\n");
