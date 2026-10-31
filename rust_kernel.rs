@@ -777,6 +777,7 @@ unsafe fn spawn_elf_image(bin: &[u8], arg: &[u8]) -> u64 {
     // 两页放行为用户可写可执行
     patch_user_region(base);
     patch_user_region(base + 0x1000);
+    *dbg = 0x11; // 探针: 页放行完成
     // 段按差值平移: 镜像里的 p_vaddr 与运行基址可以不同 (代码 RIP 相对寻址)
     // 直映射没铺之前走恒等 (低 RAM phys==virt), 铺了之后走直映射窗口
     let seg_virt = if frame::DIRECT {
@@ -815,6 +816,7 @@ unsafe fn spawn_elf_image(bin: &[u8], arg: &[u8]) -> u64 {
         *dbg = 7;
         return u64::MAX;
     }
+    *dbg = 0x22; // 探针: 段拷贝完成, 写参数块前
     // 参数块放栈页底部固定地址 (约定: base+0x1000 = len, base+0x1008 = ptr,
     // 程序用 RIP 相对读), 参数串紧随其后; 与栈顶活动区相距整页, 无碰撞
     let mut alen = arg.len();
@@ -832,8 +834,7 @@ unsafe fn spawn_elf_image(bin: &[u8], arg: &[u8]) -> u64 {
         let argv = stkw.wrapping_add(16);
         core::ptr::copy_nonoverlapping(arg.as_ptr(), argv, alen);
     }
-    *dbg = 0xFF;
-    // 入口平移: 镜像内地址 → 运行基址; 栈顶 = 第二页顶端
+    *dbg = 0x23; // 探针: 参数块完成, 进 spawn_user 前
     let entry = entry0 - img_vaddr + base;
     let s: *mut task::Scheduler = core::ptr::addr_of_mut!(SCHED);
     match (*s).spawn_user(entry, base + 0x2000) {
@@ -963,8 +964,8 @@ pub extern "C" fn rust_syscall_entry(frame: *mut syscall::SyscallFrame) -> u64 {
             f.rax = kb_take(dst, len) as u64;
             return 0;
         }
-        // 1 = SYS_WRITE 的 Linux 兼容形态: fd 1 → 行11, fd 2 → 行14 (不走能力门)
-        if f.rax == 1 && (f.rdi == 1 || f.rdi == 2) {
+        // 1 = SYS_WRITE 的 Linux 兼容形态: fd 1 → 行11, fd 2 → 行14, fd 3 → 行20 (不走能力门)
+        if f.rax == 1 && (f.rdi == 1 || f.rdi == 2 || f.rdi == 3) {
             let row = if f.rdi == 2 { 14 } else if f.rdi == 3 { 20 } else { 11 };
             let len = if f.rdx > 64 { 64 } else { f.rdx } as usize;
             let src = f.rsi as *const u8;
@@ -1387,6 +1388,9 @@ pub extern "C" fn rust_tasks_init() -> i32 {
         patch_user_region(us);
         patch_user_region(seg_base);
         patch_user_region(elf_stack_top - 4096);
+        // argv 端到端: 与 ELF 初始 spawn 完全同上下文 (enable 前直接装载),
+        // 参数 "WORLD" 走栈页参数块, 程序 write(fd3) 画到行 20
+        spawn_elf_image(core::slice::from_raw_parts(vp, vn), b"WORLD");
         0
     }
 }
