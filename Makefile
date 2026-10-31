@@ -44,7 +44,7 @@ RUSTC ?= rustc
 RUST_OK := $(shell command -v rustc >/dev/null 2>&1 && echo yes)
 ifeq ($(RUST_OK),yes)
 OBJS += rust_kernel.o
-rust_kernel.o: rust_kernel.rs frame.rs kmem.rs vma.rs pagetable.rs vmboot.rs aspace.rs capability.rs ipc.rs task.rs syscall.rs userland.rs userland2.rs userland3.rs userland4.rs userland5.rs tmpfs.rs elf.rs translator.rs elfprog.rs
+rust_kernel.o: rust_kernel.rs frame.rs kmem.rs vma.rs pagetable.rs vmboot.rs aspace.rs capability.rs ipc.rs task.rs syscall.rs userland.rs userland2.rs userland3.rs userland4.rs userland5.rs tmpfs.rs elf.rs translator.rs elfprog.rs uapp/hello.bin uapp/argv.bin
 	$(RUSTC) --crate-type lib --target x86_64-unknown-none --edition 2021 \
 	    -C opt-level=2 --emit=obj -o $@ $<
 else
@@ -98,3 +98,10 @@ sysinfo.o: sysinfo.asm
 
 spinlock.o: spinlock.asm
 	$(ASM) $(ASMFLAGS) spinlock.asm -o spinlock.o
+
+# ── test 分支新增：ring3 用户程序 (NASM -f bin 裸二进制, 经 include_bytes 进内核) ──
+uapp/hello.bin: uapp/hello.asm
+	$(ASM) -f bin $< -o $@
+
+uapp/argv.bin: uapp/argv.asm
+	$(ASM) -f bin $< -o $@

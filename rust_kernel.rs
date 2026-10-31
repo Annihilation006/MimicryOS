@@ -631,7 +631,7 @@ static mut SCHED: task::Scheduler = task::Scheduler::new();
 
 // 每任务一条独立中断栈 (TSS.RSP0 切换用): 槽位固定映射,
 // 运行期 late spawn (SYS_SPAWN / run 命令) 也能按槽补配
-static mut IRQ_STACKS: [[u8; 4096]; 12] = [[0; 4096]; 12];
+static mut IRQ_STACKS: [[u8; 4096]; 14] = [[0; 4096]; 14];
 
 unsafe fn irq_top_for(idx: usize) -> u64 {
     (core::ptr::addr_of_mut!(IRQ_STACKS) as u64) + ((idx as u64) + 1) * 4096
@@ -1320,14 +1320,13 @@ pub extern "C" fn rust_tasks_init() -> i32 {
         if FS.write(fh, 0, core::slice::from_raw_parts(img, img_len)) != img_len {
             return -4;
         }
-        // spawn 演示程序 (客户端 SYS_SPAWN 用): 写 "SPAWN OK" 到 fd 2 (行14) 后退出
+        // 用户程序一: hello —— 纯汇编 uapp/hello.asm (NASM -f bin), fd2 → 行 14
         static mut HELLO_IMG: [u8; 256] = [0; 256];
         let hp = core::ptr::addr_of_mut!(HELLO_IMG) as *mut u8;
-        let hn = elfprog::build_image_msg(
+        let hn = elfprog::build_image_code(
             core::slice::from_raw_parts_mut(hp, 256),
             0x0040_0000,
-            2,
-            *b"SPAWN OK",
+            include_bytes!("uapp/hello.bin"),
         );
         let hh = match FS.open(b"hello") {
             Some(h) => h,
@@ -1336,11 +1335,15 @@ pub extern "C" fn rust_tasks_init() -> i32 {
         if FS.write(hh, 0, core::slice::from_raw_parts(hp, hn)) != hn {
             return -4;
         }
-        // 参数版演示程序: 入口读栈页底部参数块, 把参数串 write(fd3, argv, len)
-        // 到行 20 后退出; kernel_main 与 shell `run argv <词>` 均可端到端验证
+        // 用户程序二: argv —— 纯汇编 uapp/argv.asm, 读参数块 write(fd3) → 行 20;
+        // kernel_main 与 shell `run argv <词>` 均可端到端验证参数链路
         static mut ARGV_IMG: [u8; 256] = [0; 256];
         let vp = core::ptr::addr_of_mut!(ARGV_IMG) as *mut u8;
-        let vn = elfprog::build_image_arg(core::slice::from_raw_parts_mut(vp, 256), 0x0040_0000, 3);
+        let vn = elfprog::build_image_code(
+            core::slice::from_raw_parts_mut(vp, 256),
+            0x0040_0000,
+            include_bytes!("uapp/argv.bin"),
+        );
         let vh = match FS.open(b"argv") {
             Some(h) => h,
             None => return -4,

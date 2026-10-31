@@ -172,6 +172,45 @@ pub fn build_image_arg(out: &mut [u8], base: u64, fd: u8) -> usize {
     IMG_LEN
 }
 
+/// 裸程序包装: 120B ELF 头 + 单 PT_LOAD 段 (R+X), 入口 = base+CODE_OFF。
+/// 供 NASM -f bin 的用户程序 (uapp/*.asm) 使用, blob 原样作为段内容。
+/// 头部字段直写调用方缓冲, blob 过大返回 0 (要求 out >= blob+120)。
+pub fn build_image_code(out: &mut [u8], base: u64, blob: &[u8]) -> usize {
+    let total = CODE_OFF + blob.len();
+    if blob.len() + CODE_OFF > out.len() || blob.is_empty() {
+        return 0;
+    }
+    let mut z = 0usize;
+    while z < total {
+        out[z] = 0;
+        z += 1;
+    }
+    out[0..4].copy_from_slice(&ELF_MAGIC);
+    out[4] = ELF_CLASS_64;
+    out[5] = ELF_DATA_2LSB;
+    out[6] = 1;
+    out[16..18].copy_from_slice(&2u16.to_le_bytes());
+    out[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
+    out[20..24].copy_from_slice(&1u32.to_le_bytes());
+    out[24..32].copy_from_slice(&(base + CODE_OFF as u64).to_le_bytes());
+    out[32..40].copy_from_slice(&(EH as u64).to_le_bytes());
+    out[52..54].copy_from_slice(&(EH as u16).to_le_bytes());
+    out[54..56].copy_from_slice(&(PH as u16).to_le_bytes());
+    out[56..58].copy_from_slice(&1u16.to_le_bytes());
+
+    let p = EH;
+    out[p..p + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+    out[p + 4..p + 8].copy_from_slice(&(PF_R | PF_X).to_le_bytes());
+    out[p + 8..p + 16].copy_from_slice(&0u64.to_le_bytes());
+    out[p + 16..p + 24].copy_from_slice(&base.to_le_bytes());
+    out[p + 24..p + 32].copy_from_slice(&base.to_le_bytes());
+    out[p + 32..p + 40].copy_from_slice(&(total as u64).to_le_bytes());
+    out[p + 40..p + 48].copy_from_slice(&(total as u64).to_le_bytes());
+    out[p + 48..p + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+    out[CODE_OFF..total].copy_from_slice(blob);
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +256,21 @@ mod tests {
         // 位置无关: 换基址装载, 入口随差值平移
         let entry = load(&buf[..n], |_, _, _| Ok(())).unwrap();
         assert_eq!(entry, 0x0040_0000 + CODE_OFF as u64);
+    }
+
+    #[test]
+    fn bin_wrapper_carries_blob() {
+        let mut buf = [0u8; 256];
+        let blob: &[u8] = &[0x90, 0xEB, 0xFE];
+        let n = build_image_code(&mut buf, 0x0040_0000, blob);
+        assert_eq!(n, CODE_OFF + 3);
+        let entry = load(&buf[..n], |_, _, _| Ok(())).unwrap();
+        assert_eq!(entry, 0x0040_0000 + CODE_OFF as u64);
+        assert_eq!(&buf[CODE_OFF..n], blob);
+        // 过大 blob 拒绝 (返回 0, 不写缓冲)
+        let big = [0u8; 4000];
+        let mut buf2 = [0u8; 256];
+        assert_eq!(build_image_code(&mut buf2, 0, &big), 0);
     }
 
     #[test]

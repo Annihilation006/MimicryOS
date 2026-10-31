@@ -28,7 +28,7 @@ pub struct Sleeper {
 pub const NSLEEP: usize = 8;
 
 pub struct Scheduler {
-    pub t: [Task; 12],
+    pub t: [Task; 14],
     pub n: usize,   // 已占槽上限（死槽可复用）
     pub cur: usize, // 当前运行槽
     pub sleepers: [Sleeper; NSLEEP],
@@ -37,7 +37,7 @@ pub struct Scheduler {
 impl Scheduler {
     pub const fn new() -> Self {
         Scheduler {
-            t: [Task { rsp: 0, live: false, dead: false, prio: 1, irq_top: 0 }; 12],
+            t: [Task { rsp: 0, live: false, dead: false, prio: 1, irq_top: 0 }; 14],
             n: 0,
             cur: 0,
             sleepers: [Sleeper { task: 0, deadline: 0, used: false }; NSLEEP],
@@ -47,7 +47,7 @@ impl Scheduler {
     // 把正在跑的上下文（kernel_main/shell）收编为任务 0:
     // rsp=0 表示还没被打断过, 第一次 tick 自然把真现场存进来
     pub unsafe fn adopt_current(&mut self) -> usize {
-        if self.n >= 12 {
+        if self.n >= 14 {
             return usize::MAX;
         }
         let t = core::ptr::addr_of_mut!(self.t) as *mut Task;
@@ -221,7 +221,7 @@ impl Scheduler {
         cs: u64,
         ss: u64,
     ) -> Option<usize> {
-        if self.n >= 12 {
+        if self.n >= 14 {
             return None;
         }
         let frame = stack_top - (FRAME_SLOTS * 8) as u64;
@@ -309,11 +309,12 @@ mod tests {
     fn t4_slots_cap() {
         let mut stacks = Vec::new();
         let mut s = Scheduler::new();
-        for _ in 0..12 {
+        for _ in 0..14 {
             let (v, top) = mkstack();
             stacks.push(v);
             assert!(unsafe { s.spawn(0x1000, top) }.is_some());
         }
+        // 满员后 spawn 返回 None, 且绝不触碰调用方给的栈
         unsafe { assert_eq!(s.spawn(0x1000, 4096), None); }
     }
 
