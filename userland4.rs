@@ -294,6 +294,28 @@ pub extern "C" fn cli_start() -> ! {
                                 glyph(b'3', SX + 25, SY + 24, RED);
                             }
                         }
+                        // 堆演示后: fat12 磁盘轮 —— d: 前缀走翻译器的磁盘后端
+                        // 写 "FAT12 OK" 进磁盘再读回, 行 23 显 D+OK/NO
+                        let dfd = vfs_open(b"d:T");
+                        if dfd >= 0 {
+                            let dw = vfs_write(dfd, b"FAT12 OK");
+                            let dn = vfs_read(dfd);
+                            let dp = core::ptr::addr_of!(RBUF) as *const u8;
+                            let dok = dw == 8
+                                && dn == 8
+                                && *dp == b'F'
+                                && *dp.add(1) == b'A'
+                                && *dp.add(2) == b'T';
+                            fill(SX, SY + 44, 70, 20, BLACK);
+                            glyph(b'D', SX + 1, SY + 46, if dok { CYAN } else { RED });
+                            if dok {
+                                glyph(b'O', SX + 13, SY + 46, CYAN);
+                                glyph(b'K', SX + 25, SY + 46, CYAN);
+                            } else {
+                                glyph(b'N', SX + 13, SY + 46, RED);
+                                glyph(b'3', SX + 25, SY + 46, RED);
+                            }
+                        }
                     }
                 } else {
                     glyph(b'N', DX + 99, DY + 2, color);

@@ -188,6 +188,35 @@ impl FsBack for KernelFs {
     }
 }
 
+/// 磁盘后端: 名字带 `d:` 前缀的文件落 fat12 (朋友磁盘, ata 原语)。
+/// fd 编码 = 8 + 目录项偏移, 与 tmpfs 的 0..7 不撞。
+struct DiskFs;
+const DISK_FD_BASE: usize = 8;
+impl FsBack for DiskFs {
+    fn open(&mut self, name: &[u8]) -> Option<usize> {
+        // 剥掉 d: 前缀再交给 fat12 查找/创建
+        let bare = if name.len() >= 2 && name[0] == b'd' && name[1] == b':' {
+            &name[2..]
+        } else {
+            name
+        };
+        let mut f12 = crate::fat12::Fat12Back;
+        f12.open(bare).map(|e| e + DISK_FD_BASE)
+    }
+    fn read(&self, h: usize, off: usize, dst: &mut [u8]) -> usize {
+        let mut f12 = crate::fat12::Fat12Back;
+        f12.read(h - DISK_FD_BASE, off, dst)
+    }
+    fn write(&mut self, h: usize, off: usize, src: &[u8]) -> usize {
+        let mut f12 = crate::fat12::Fat12Back;
+        f12.write(h - DISK_FD_BASE, off, src)
+    }
+    fn size(&self, h: usize) -> usize {
+        let mut f12 = crate::fat12::Fat12Back;
+        f12.size(h - DISK_FD_BASE)
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn srv_start() -> ! {
     loop {
@@ -199,11 +228,29 @@ pub extern "C" fn srv_start() -> ! {
             // 阻塞等请求: 通道空时内核挂起本任务
             let r = ipc_recv(ep_q(), rb, core::ptr::addr_of_mut!(mlen), core::ptr::addr_of_mut!(mcap));
             if r == 0 && mlen as usize >= translator::REQ_SIZE {
-                let n = translator::serve(
-                    core::slice::from_raw_parts(rb, mlen as usize),
-                    &mut *(core::ptr::addr_of_mut!(RESP_BUF) as *mut [u8; translator::RESP_SIZE]),
-                    &mut KernelFs,
-                );
+                let req = core::slice::from_raw_parts(rb, mlen as usize);
+                // 命名空间路由: OPEN 请求名带 `d:` 前缀或 fd≥8 的读写 → 磁盘后端
+                let op = translator::req_op(req);
+                let fd = translator::req_fd(req) as usize;
+                let name_d = op == translator::FS_OP_OPEN
+                    && req.len() > translator::REQ_SIZE + 1
+                    && translator::req_name(req, 0) == b'd'
+                    && translator::req_name(req, 1) == b':';
+                let n = if name_d || (op != translator::FS_OP_OPEN && fd >= DISK_FD_BASE) {
+                    let mut disk = DiskFs;
+                    translator::serve(
+                        req,
+                        &mut *(core::ptr::addr_of_mut!(RESP_BUF) as *mut [u8; translator::RESP_SIZE]),
+                        &mut disk,
+                    )
+                } else {
+                    let mut kfs = KernelFs;
+                    translator::serve(
+                        req,
+                        &mut *(core::ptr::addr_of_mut!(RESP_BUF) as *mut [u8; translator::RESP_SIZE]),
+                        &mut kfs,
+                    )
+                };
                 // 应答回原请求通道对 (通道2), 带上请求方的能力标签
                 let _ = ipc_send(ep_r(), pb, n as u64);
             }

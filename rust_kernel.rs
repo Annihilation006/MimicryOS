@@ -60,6 +60,8 @@ mod elf;
 mod translator;
 #[path = "elfprog.rs"]
 mod elfprog;
+#[path = "fat12.rs"]
+mod fat12;
 
 use core::panic::PanicInfo;
 
