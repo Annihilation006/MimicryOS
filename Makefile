@@ -32,7 +32,7 @@ ASM = nasm
 ASMFLAGS = -f elf64
 OBJCOPY = objcopy
 
-OBJS = kernel.o filesystem.mod.o mouse.mod.o desktop.mod.o png.mod.o font.o cpu.o idt.o interrupt.o pic.o console.o isr.o usermode.o vmo.o kbdrv.o capacct.o sysinfo.o spinlock.o
+OBJS = kernel.o filesystem.mod.o mouse.mod.o desktop.mod.o png.mod.o font.o cpu.o idt.o interrupt.o pic.o console.o isr.o usermode.o vmo.o kbdrv.o capacct.o sysinfo.o spinlock.o ata.o
 
 all: kernel.elf
 
@@ -98,6 +98,10 @@ sysinfo.o: sysinfo.asm
 
 spinlock.o: spinlock.asm
 	$(ASM) $(ASMFLAGS) spinlock.asm -o spinlock.o
+
+# AT&T 语法 (GAS): 走 CC 驱动编译, 与 C 同一工具链
+ata.o: ata.S
+	$(CC) $(CFLAGS) -c ata.S -o ata.o
 
 # ── test 分支新增：ring3 用户程序 (NASM -f bin 裸二进制, 经 include_bytes 进内核) ──
 uapp/hello.bin: uapp/hello.asm

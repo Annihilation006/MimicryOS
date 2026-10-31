@@ -22,6 +22,9 @@ typedef short int16_t;
 extern void kbdrv_init(void);        /* [test] 装 33 号门 + 放行 IRQ1 */
 extern char kbdrv_getc(void);   /* [test] IRQ1 汇编键盘驱动: 阻塞取字符 */
 extern int rust_direct_map_init(unsigned long long max_phys);
+extern void ata_drv_init(void); /* [test] 纯汇编 ATA 驱动: 识别+LBA48 探测 */
+extern int ata_drv_read(unsigned long long lba, unsigned short count, void *buf);
+extern int ata_drv_write(unsigned long long lba, unsigned short count, void *buf);
 /* [test] run 命令: tmpfs ELF → 新任务 */
 extern unsigned long long rust_spawn_file(unsigned char *name, unsigned char *arg, unsigned long long arglen); /* [test] run 命令 */
 extern void asm_sysinfo_collect(unsigned char *out);   /* [test] 纯汇编 CPU 信息收集 */
@@ -499,23 +502,13 @@ static void ata_select(unsigned int lba) {
 }
 
 void ata_write(unsigned int lba, void* buffer) {
-    if (!ata_wait_not_busy()) { fb_print("ATA busy\n"); return; }
-    ata_select(lba);
-    outb(0x1F7, 0x30);                   /* 写扇区命令 */
-    if (!ata_wait_drq()) { fb_print("ATA write fail\n"); return; }
-    for (int i = 0; i < 256; i++) {
-        outw(0x1F0, ((unsigned short*)buffer)[i]);
-    }
+    /* [test] 签名保持不变, 体内改走纯汇编 LBA48 驱动 (含 cache flush) */
+    ata_drv_write((unsigned long long)lba, 1, buffer);
 }
 
 void ata_read(unsigned int lba, void* buffer) {
-    if (!ata_wait_not_busy()) { fb_print("ATA busy\n"); return; }
-    ata_select(lba);
-    outb(0x1F7, 0x20);                   /* 读扇区命令 */
-    if (!ata_wait_drq()) { fb_print("ATA read fail\n"); return; }
-    for (int i = 0; i < 256; i++) {
-        ((unsigned short*)buffer)[i] = inw(0x1F0);
-    }
+    /* [test] 签名保持不变 (原作者接口), 体内改走纯汇编 LBA48 驱动 ata.S */
+    ata_drv_read((unsigned long long)lba, 1, buffer);
 }
 void outw(uint16_t port, uint16_t val) {
     __asm__ volatile("outw %0, %1" : : "a"(val), "d"(port));
@@ -922,6 +915,7 @@ void kernel_main(void) {
      * 开机动画期间 cli 着, 这里装好再 sti */
     idt_init();
     pic_remap();
+    ata_drv_init();             /* [test] 纯汇编 ATA 驱动上线 (识别+LBA48) */
     extern void usermode_init(void);
     usermode_init();            /* [test] GDT/TSS/int0x80 全 asm */
     rust_direct_map_init(0x40000000ULL); /* [test] 直映射上线 (1GB), 不切 CR3 */
