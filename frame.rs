@@ -89,8 +89,12 @@ impl FrameAllocator {
             w -= 1;
             let word = *self.bitmap.add(w);
             if word != !0u64 {
-                let lz = word.leading_zeros() as usize;
-                let b = 63 - lz; // 最高位的 0
+                // 最高空闲位 = 63 - (!word) 的 leading_zeros。
+                // 旧写法 63 - word.leading_zeros() 有两个雷: word 高位
+                // 已占用时 lz=0 → 重复返回最高帧 (帧别名, vmboot 三重
+                // 故障根因); word 全空闲时 lz=64 → 下溢。
+                let inv = !word;
+                let b = 63 - inv.leading_zeros() as usize;
                 let idx = w * WORD_BITS + b;
                 if idx < self.total {
                     *self.bitmap.add(w) = word | (1u64 << b);
@@ -177,6 +181,28 @@ mod tests {
         unsafe { fa.init_all_used() };
         assert_eq!(fa.free_count(), 0);
         assert_eq!(unsafe { fa.alloc() }, None);
+    }
+
+    #[test]
+    fn t01b_top_alloc_fully_free_word() {
+        // 顶部整字全空闲的场景 (vmboot 分配页表帧时的实际情况):
+        // alloc_top 应从最高帧往下发, 三次互异——锁住该语义
+        let total = 64 * 3; // 恰 3 个整字
+        let (bm, mut fa) = new_alloc(total);
+        unsafe {
+            fa.init_all_used();
+            fa.mark_free_range(0, total); // 全部放开: 每个字都全空闲
+            let a = fa.alloc_top().unwrap();
+            let b = fa.alloc_top().unwrap();
+            let c = fa.alloc_top().unwrap();
+            assert_ne!(a, b);
+            assert_ne!(b, c);
+            assert_ne!(a, c);
+            assert_eq!(a, total - 1);
+            assert_eq!(b, total - 2);
+            assert_eq!(c, total - 3);
+        }
+        drop(bm);
     }
 
     #[test]
