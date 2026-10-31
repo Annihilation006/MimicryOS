@@ -628,6 +628,14 @@ pub extern "C" fn rust_vmo_unref(handle: i32) -> i32 {
 // ============================================================
 
 static mut SCHED: task::Scheduler = task::Scheduler::new();
+
+// 每任务一条独立中断栈 (TSS.RSP0 切换用): 槽位固定映射,
+// 运行期 late spawn (SYS_SPAWN / run 命令) 也能按槽补配
+static mut IRQ_STACKS: [[u8; 4096]; 12] = [[0; 4096]; 12];
+
+unsafe fn irq_top_for(idx: usize) -> u64 {
+    (core::ptr::addr_of_mut!(IRQ_STACKS) as u64) + ((idx as u64) + 1) * 4096
+}
 static mut STACK_A: [u8; 16384] = [0; 16384];
 static mut STACK_B: [u8; 16384] = [0; 16384];
 static mut CNT_A: u32 = 0;
@@ -645,6 +653,9 @@ extern "C" {
     fn fb_putpixel(x: i32, y: i32, color: u32);
     fn vmo_init(); // vmo.asm: 共享内存池
     static user_stack_top: u8; // usermode.asm 的符号
+    fn capacct_init(); // capacct.c: 能力归属账本清零
+    fn capacct_note(slot: u32, task: u8);
+    fn capacct_reap(task: u8, out: *mut u32, max: i32) -> i32;
 }
 
 // Rust 侧自己的 tick 计数 (rust_tick_hook 每 tick +1), 睡眠时限的基准
@@ -827,6 +838,8 @@ unsafe fn spawn_elf_image(bin: &[u8], arg: &[u8]) -> u64 {
     let s: *mut task::Scheduler = core::ptr::addr_of_mut!(SCHED);
     match (*s).spawn_user(entry, base + 0x2000) {
         Some(i) => {
+            // late spawn 补配独立中断栈, 槽位固定映射不会与 init 任务相撞
+            (*s).set_irq_top(i as usize, irq_top_for(i as usize));
             // 窗口与任务槽绑定, 退出时按槽归还
             *wt.add(w) = i;
             i as u64
@@ -918,6 +931,16 @@ pub extern "C" fn rust_syscall_entry(frame: *mut syscall::SyscallFrame) -> u64 {
         if f.rax == 60 {
             let s: *mut task::Scheduler = core::ptr::addr_of_mut!(SCHED);
             let me = (*s).cur_index();
+            // 退出清算: 名下能力槽整批级联回收, 账随槽清
+            // (reap 上界 16 由账本容量保证, 裸指针遍历避开越界检查符号)
+            let mut dead: [u32; 16] = [0; 16];
+            let n = capacct_reap(me as u8, dead.as_mut_ptr(), 16) as usize;
+            let dp = dead.as_ptr();
+            let mut k = 0usize;
+            while k < n {
+                rust_cap_revoke(*dp.add(k));
+                k += 1;
+            }
             (*s).exit_cur();
             // 归还装载窗口: 任务退出, 它占的窗口下个 spawn 可复用
             let wt = core::ptr::addr_of_mut!(WINTAB) as *mut usize;
@@ -942,7 +965,7 @@ pub extern "C" fn rust_syscall_entry(frame: *mut syscall::SyscallFrame) -> u64 {
         }
         // 1 = SYS_WRITE 的 Linux 兼容形态: fd 1 → 行11, fd 2 → 行14 (不走能力门)
         if f.rax == 1 && (f.rdi == 1 || f.rdi == 2) {
-            let row = if f.rdi == 2 { 14 } else { 11 };
+            let row = if f.rdi == 2 { 14 } else if f.rdi == 3 { 20 } else { 11 };
             let len = if f.rdx > 64 { 64 } else { f.rdx } as usize;
             let src = f.rsi as *const u8;
             let mut k = 0usize;
@@ -1075,7 +1098,15 @@ pub extern "C" fn rust_syscall_entry(frame: *mut syscall::SyscallFrame) -> u64 {
                     k += 1;
                 }
                 match FS.open(&name) {
-                    Some(h) => rust_cap_grant(syscall::CAP_FRAMEBUF, h as u32) as u64,
+                    Some(h) => {
+                        let tok = rust_cap_grant(syscall::CAP_FRAMEBUF, h as u32);
+                        // 记归属: 调用任务退出时随 reap 整批回收
+                        if tok != capability::NO_SLOT {
+                            let s: *mut task::Scheduler = core::ptr::addr_of_mut!(SCHED);
+                            capacct_note(tok, (*s).cur_index() as u8);
+                        }
+                        tok as u64
+                    }
                     None => u64::MAX,
                 }
             } else {
@@ -1223,6 +1254,7 @@ pub extern "C" fn rust_tasks_init() -> i32 {
     unsafe {
         // 能力系统上线, 发两把钥匙: 帧缓冲(VMO) + IPC 端点(ENDPOINT)
         rust_cap_init();
+        capacct_init(); // [test] C 侧归属账本随能力系统一起上线
         let tok = rust_cap_grant(syscall::CAP_FRAMEBUF, 0);
         let tp: *mut u32 = core::ptr::addr_of_mut!(PAYLOAD_TOKEN);
         *tp = tok;
@@ -1287,8 +1319,7 @@ pub extern "C" fn rust_tasks_init() -> i32 {
         if FS.write(fh, 0, core::slice::from_raw_parts(img, img_len)) != img_len {
             return -4;
         }
-        // spawn 演示程序: 写 "SPAWN OK" 到 fd 2 (行14) 后退出, 供 SYS_SPAWN 装载。
-        // 参数版 (build_image_arg) 机制已就位但用户态读参尚待调试, 暂用固定消息版
+        // spawn 演示程序 (客户端 SYS_SPAWN 用): 写 "SPAWN OK" 到 fd 2 (行14) 后退出
         static mut HELLO_IMG: [u8; 256] = [0; 256];
         let hp = core::ptr::addr_of_mut!(HELLO_IMG) as *mut u8;
         let hn = elfprog::build_image_msg(
@@ -1304,11 +1335,11 @@ pub extern "C" fn rust_tasks_init() -> i32 {
         if FS.write(hh, 0, core::slice::from_raw_parts(hp, hn)) != hn {
             return -4;
         }
-        // 参数版演示程序: 入口读栈页底部参数块 write(fd2, argv, len) 后退出,
-        // shell `run argv <词>` 即可端到端验证参数链路
+        // 参数版演示程序: 入口读栈页底部参数块, 把参数串 write(fd3, argv, len)
+        // 到行 20 后退出; kernel_main 与 shell `run argv <词>` 均可端到端验证
         static mut ARGV_IMG: [u8; 256] = [0; 256];
         let vp = core::ptr::addr_of_mut!(ARGV_IMG) as *mut u8;
-        let vn = elfprog::build_image_arg(core::slice::from_raw_parts_mut(vp, 256), 0x0040_0000);
+        let vn = elfprog::build_image_arg(core::slice::from_raw_parts_mut(vp, 256), 0x0040_0000, 3);
         let vh = match FS.open(b"argv") {
             Some(h) => h,
             None => return -4,
@@ -1347,10 +1378,9 @@ pub extern "C" fn rust_tasks_init() -> i32 {
             return -1;
         }
         // 每任务一条独立中断栈, 调度切换时写 TSS.RSP0 — ring3 帧不再互相踩
-        static mut IRQ_STACKS: [[u8; 4096]; 12] = [[0; 4096]; 12];
+        // 每任务一条独立中断栈: 按槽位固定映射, 运行期任何时刻 spawn 都能补配
         for i in 0..(*s).n {
-            let top = (core::ptr::addr_of_mut!(IRQ_STACKS) as u64) + ((i as u64) + 1) * 4096;
-            (*s).set_irq_top(i, top);
+            (*s).set_irq_top(i, irq_top_for(i));
         }
         // 直映射已上线, 页表修补在 Rust 里做
         patch_user_region(ue);

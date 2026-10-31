@@ -136,8 +136,9 @@ const ARG_CODE: [u8; ARG_CODE_LEN] = [
     0xEB, 0xFE, // jmp $
 ];
 
-/// 参数版镜像: 入口即 write(2, argv, len) 后退出。IMG_LEN 同为 161。
-pub fn build_image_arg(out: &mut [u8], base: u64) -> usize {
+/// 参数版镜像: 入口即 write(fd, argv, len) 后退出 (fd 由调用方定,
+/// 内核按 fd 选输出行: 1→行11, 2→行14, 3→行20)。IMG_LEN 同为 161。
+pub fn build_image_arg(out: &mut [u8], base: u64, fd: u8) -> usize {
     let mut buf = [0u8; IMG_LEN];
     buf[0..4].copy_from_slice(&ELF_MAGIC);
     buf[4] = ELF_CLASS_64;
@@ -162,6 +163,8 @@ pub fn build_image_arg(out: &mut [u8], base: u64) -> usize {
     buf[p + 40..p + 48].copy_from_slice(&(IMG_LEN as u64).to_le_bytes());
     buf[p + 48..p + 56].copy_from_slice(&0x1000u64.to_le_bytes());
     buf[CODE_OFF..CODE_OFF + ARG_CODE_LEN].copy_from_slice(&ARG_CODE);
+    // fd 立即数在 mov edi,imm32 的操作数位 (指令起于 CODE_OFF+25, imm 在 +26)
+    buf[CODE_OFF + 26..CODE_OFF + 30].copy_from_slice(&(fd as u32).to_le_bytes());
 
     unsafe {
         core::ptr::copy_nonoverlapping(buf.as_ptr(), out.as_mut_ptr(), IMG_LEN);
@@ -219,7 +222,7 @@ mod tests {
     #[test]
     fn arg_variant_reads_stack() {
         let mut buf = [0u8; 256];
-        let n = build_image_arg(&mut buf, 0x0040_0000);
+        let n = build_image_arg(&mut buf, 0x0040_0000, 2);
         assert_eq!(n, IMG_LEN);
         let code = &buf[CODE_OFF..CODE_OFF + ARG_CODE_LEN];
         // RIP 相对取参: 两条 lea/mov 的 disp 指向栈页底部
@@ -230,6 +233,8 @@ mod tests {
         // 指令止于 CODE_OFF+7 / +14, 目标 = base+0x1000 / +0x1008
         assert_eq!(da as usize, 0x1000 - CODE_OFF - 7);
         assert_eq!(db as usize, 0x1000 - CODE_OFF - 14);
+        // fd 立即数随参数可变: mov edi, fd
+        assert_eq!(&code[25..30], &[0xBF, 2, 0, 0, 0]);
         let entry = load(&buf[..n], |_, _, _| Ok(())).unwrap();
         assert_eq!(entry, 0x0040_0000 + CODE_OFF as u64);
     }

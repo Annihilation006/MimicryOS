@@ -930,12 +930,6 @@ void kernel_main(void) {
     outb(0x40, 11932 >> 8);
     rust_tasks_init();          /* [test] 两个 Rust 内核线程进就绪队列 */
     enable_interrupts();
-    for (volatile long w = 0; w < 50000000; w++);
-    fb_print("[test] interrupts ");
-    if (pit_ticks > 10) fb_print("ALIVE, ticks=");
-    else fb_print("DEAD, ticks=");
-    print_int((int)pit_ticks);
-    fb_print("\n");
 
     fb_print("MimicryOS Shell\n");
     fb_print("Type help for commands\n");
