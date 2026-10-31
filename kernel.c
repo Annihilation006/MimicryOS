@@ -21,7 +21,7 @@ typedef short int16_t;
 
 extern void kbdrv_init(void);        /* [test] 装 33 号门 + 放行 IRQ1 */
 extern char kbdrv_getc(void);   /* [test] IRQ1 汇编键盘驱动: 阻塞取字符 */
-extern int rust_direct_map_init(unsigned long long max_phys);
+extern int rust_vm_bootstrap(unsigned long long max_phys); /* [test] 页表自举: 抄高半区+铺直映射+切 CR3 */
 extern void ata_drv_init(void); /* [test] 纯汇编 ATA 驱动: 识别+LBA48 探测 */
 extern int ata_drv_read(unsigned long long lba, unsigned short count, void *buf);
 extern int ata_drv_write(unsigned long long lba, unsigned short count, void *buf);
@@ -918,7 +918,7 @@ void kernel_main(void) {
     ata_drv_init();             /* [test] 纯汇编 ATA 驱动上线 (识别+LBA48) */
     extern void usermode_init(void);
     usermode_init();            /* [test] GDT/TSS/int0x80 全 asm */
-    rust_direct_map_init(0x40000000ULL); /* [test] 直映射上线 (1GB), 不切 CR3 */
+    rust_vm_bootstrap(0x40000000ULL); /* [test] 页表自举上线 (帧别名已修) */
     kbdrv_init();                        /* [test] IRQ1 汇编键盘驱动上线 */
     register_interrupt_handler(32, pit_tick);
     pic_clear_mask(0);          /* IRQ0 计时器 */
